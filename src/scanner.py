@@ -217,23 +217,26 @@ class SecurityHeaderScanner:
     
     def _get_response_headers(self, url: str) -> tuple[Optional[int], Dict[str, str], Optional[str], Optional[str]]:
         """
-        Fetch headers from URL.
+        Fetch headers from URL using GET request (more reliable than HEAD).
         
         Returns:
             Tuple of (status_code, headers_dict, final_url, error_message)
         """
         self._rate_limit()
         
-        headers = {"User-Agent": self.user_agent}
+        request_headers = {"User-Agent": self.user_agent}
         
         for attempt in range(self.max_retries):
             try:
-                response = requests.head(
+                # Use GET request - more reliable for getting all headers
+                # Some servers don't return security headers on HEAD requests
+                response = requests.get(
                     url,
-                    headers=headers,
+                    headers=request_headers,
                     timeout=self.timeout,
                     allow_redirects=self.follow_redirects,
                     verify=True,
+                    stream=True,  # Don't download body
                 )
                 
                 # Convert headers to lowercase keys
@@ -350,11 +353,29 @@ class SecurityHeaderScanner:
                 if header_def.name in seen_headers:
                     continue
                 seen_headers.add(header_def.name)
+                
                 # Find the header value
-                header_value = self._find_security_header(header_def.name, headers)
+                header_value = None
+                header_name_used = None
+                
+                # Special handling for CSP - check active CSP first, then CSPRO
+                if header_def.name == "content-security-policy":
+                    # Check for active CSP
+                    header_value = headers.get("content-security-policy")
+                    header_name_used = "content-security-policy"
+                    
+                    # If no active CSP, check CSPRO
+                    if not header_value:
+                        csp_ro = headers.get("content-security-policy-report-only")
+                        if csp_ro:
+                            header_value = csp_ro
+                            header_name_used = "content-security-policy-report-only"
+                else:
+                    header_value = self._find_security_header(header_def.name, headers)
+                    header_name_used = header_def.name
                 
                 # Validate and get status
-                status, _ = header_def.validate(header_value)
+                status, _ = header_def.validate(header_value, header_name_used)
                 
                 # Calculate score
                 score = self._calculate_header_score(status, header_def.weight)

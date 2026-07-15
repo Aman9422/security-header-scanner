@@ -60,11 +60,11 @@ class SecurityHeader:
     category: str = "general"
     aliases: List[str] = field(default_factory=list)
     
-    def validate(self, value: Optional[str]) -> tuple[HeaderStatus, Dict[str, Any]]:
+    def validate(self, value: Optional[str], header_name: str = "") -> tuple[HeaderStatus, Dict[str, Any]]:
         """Validate header value and return status with details"""
         if value is None:
             return HeaderStatus.MISSING, {}
-        return self.check_function(value), {}
+        return self.check_function(value, header_name), {}
     
     def get_remediation(self, status: HeaderStatus) -> Remediation:
         """Get remediation for a given status"""
@@ -138,7 +138,7 @@ class HeaderRegistry:
     def _create_strict_transport_security(self) -> SecurityHeader:
         """Create Strict-Transport-Security header definition"""
         
-        def check(value: str) -> HeaderStatus:
+        def check(value: str, header_name: str = "") -> HeaderStatus:
             if not value:
                 return HeaderStatus.MISSING
             
@@ -201,41 +201,74 @@ class HeaderRegistry:
     def _create_content_security_policy(self) -> SecurityHeader:
         """Create Content-Security-Policy header definition"""
         
-        def check(value: str) -> HeaderStatus:
+        def check(value: str, header_name: str = "") -> HeaderStatus:
             if not value:
                 return HeaderStatus.MISSING
             
-            # Required directives for a good CSP
-            required_directives = ['default-src']
-            recommended_directives = ['script-src', 'style-src', 'img-src', 'font-src']
+            # Check if it's report-only mode (not actively blocking)
+            is_report_only = (
+                value.lower().startswith("report-") or 
+                "report-only" in header_name.lower()
+            )
             
-            # Check if it's report-only (less secure)
-            if value.startswith("report-uri") or "report-to" in value.lower():
+            # Check for dangerously permissive patterns (standalone wildcards in quotes)
+            has_dangerous_wildcard = False
+            if re.search(r"[^a-z-] \*[^a-z]", value) or re.search(r"'\s*\*\s*'", value):
+                has_dangerous_wildcard = True
+            
+            # Check for unsafe-eval (without nonce)
+            has_unsafe_eval = "'unsafe-eval'" in value
+            has_nonce = "nonce-" in value.lower()
+            has_hash = "hash-" in value.lower()
+            has_strict_dynamic = "'strict-dynamic'" in value
+            
+            # Modern restrictive directives
+            has_object_src_none = "object-src 'none'" in value or 'object-src "none"' in value
+            has_base_uri_self = "base-uri 'self'" in value or 'base-uri "self"' in value
+            has_default_src_none = "default-src 'none'" in value or 'default-src "none"' in value
+            has_default_src_self = "default-src 'self'" in value or 'default-src "self"' in value
+            
+            # Count specific directives
+            specific_directives = [
+                'default-src', 'script-src', 'style-src', 'img-src', 
+                'font-src', 'connect-src', 'media-src', 'object-src',
+                'base-uri', 'form-action', 'frame-ancestors', 'child-src',
+                'worker-src', 'frame-src'
+            ]
+            directive_count = sum(1 for d in specific_directives if d in value)
+            
+            # Report-only CSP should always be WEAK (not actively blocking)
+            # Even if it has good directives, it's not protecting
+            if is_report_only:
                 return HeaderStatus.WEAK
             
-            # Check for unsafe directives (indicates weak CSP)
-            unsafe_patterns = ["'unsafe-inline'", "'unsafe-eval'", "*", "data:"]
-            unsafe_count = sum(1 for p in unsafe_patterns if p in value)
+            # Determine status for active CSP
+            # Has default-src 'none' = PRESENT (most restrictive)
+            if has_default_src_none:
+                return HeaderStatus.PRESENT
             
-            # Check for basic allow-all (*)
-            if value.strip() == "*" or value == "default-src *":
+            # Has dangerous wildcard or unsafe-eval without nonce = MISCONFIGURED
+            if (has_dangerous_wildcard or has_unsafe_eval) and not (has_nonce or has_hash):
                 return HeaderStatus.MISCONFIGURED
             
-            # Check for required directives presence
-            has_default_src = 'default-src' in value
+            # Has object-src 'none' + base-uri 'self' + nonce = PRESENT (Google-style)
+            if has_object_src_none and has_base_uri_self and (has_nonce or has_strict_dynamic):
+                return HeaderStatus.PRESENT
             
-            if unsafe_count >= 2:
-                return HeaderStatus.MISCONFIGURED
-            elif unsafe_count == 1:
+            # Has default-src 'self' with multiple directives = PRESENT
+            if has_default_src_self and directive_count >= 4:
+                return HeaderStatus.PRESENT
+            
+            # Has nonce with specific script-src = PRESENT
+            if has_nonce and 'script-src' in value:
+                return HeaderStatus.PRESENT
+            
+            # Has multiple specific directives = WEAK
+            if directive_count >= 3:
                 return HeaderStatus.WEAK
-            elif has_default_src:
-                # Check for restrictive directives
-                restrictive_count = sum(1 for d in recommended_directives if d in value)
-                if restrictive_count >= 3:
-                    return HeaderStatus.PRESENT
-                return HeaderStatus.WEAK
-            else:
-                return HeaderStatus.WEAK
+            
+            # Basic CSP exists but is weak
+            return HeaderStatus.WEAK
         
         return SecurityHeader(
             name="content-security-policy",
@@ -248,26 +281,25 @@ class HeaderRegistry:
             remediation={
                 HeaderStatus.MISSING: Remediation(
                     severity=Severity.HIGH,
-                    action="Add a restrictive Content-Security-Policy header",
-                    example="default-src 'self'; script-src 'self' 'nonce-{random}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'",
+                    action="Add a Content-Security-Policy header (not Report-Only)",
+                    example="default-src 'none'; base-uri 'self'; script-src 'self' 'nonce-{random}'; style-src 'self'",
                     resources=[
                         "https://developer.mozilla.org/en-US/docs/Web/HTTP/CSP",
                         "https://csp-evaluator.withgoogle.com/"
                     ]
                 ),
                 HeaderStatus.WEAK: Remediation(
-                    severity=Severity.MEDIUM,
-                    action="Remove unsafe-inline/unsafe-eval and add nonce or hash",
-                    example="default-src 'self'; script-src 'self' 'nonce-rAnd0m'",
+                    severity=Severity.HIGH,
+                    action="Change from CSP-Report-Only to active CSP",
+                    example="Replace Content-Security-Policy-Report-Only with Content-Security-Policy",
                     resources=[
-                        "https://csp-evaluator.withgoogle.com/",
-                        "https://hacks.mozilla.org/2016/04/you-might-not-need-a-content-security-policy/"
+                        "https://csp-evaluator.withgoogle.com/"
                     ]
                 ),
                 HeaderStatus.MISCONFIGURED: Remediation(
                     severity=Severity.CRITICAL,
-                    action="Remove permissive wildcard (*) and unsafe directives",
-                    example="default-src 'none'; script-src 'self'; style-src 'self'",
+                    action="Remove wildcard (*) and unsafe directives",
+                    example="default-src 'none'; base-uri 'self'; script-src 'self' 'nonce-rAnd0m'",
                     resources=["https://csp-evaluator.withgoogle.com/"]
                 ),
             }
@@ -276,7 +308,7 @@ class HeaderRegistry:
     def _create_x_frame_options(self) -> SecurityHeader:
         """Create X-Frame-Options header definition"""
         
-        def check(value: str) -> HeaderStatus:
+        def check(value: str, header_name: str = "") -> HeaderStatus:
             if not value:
                 return HeaderStatus.MISSING
             
@@ -325,7 +357,7 @@ class HeaderRegistry:
     def _create_x_content_type_options(self) -> SecurityHeader:
         """Create X-Content-Type-Options header definition"""
         
-        def check(value: str) -> HeaderStatus:
+        def check(value: str, header_name: str = "") -> HeaderStatus:
             if not value:
                 return HeaderStatus.MISSING
             
@@ -362,7 +394,7 @@ class HeaderRegistry:
     def _create_x_xss_protection(self) -> SecurityHeader:
         """Create X-XSS-Protection header definition"""
         
-        def check(value: str) -> HeaderStatus:
+        def check(value: str, header_name: str = "") -> HeaderStatus:
             if not value:
                 return HeaderStatus.MISSING
             
@@ -423,21 +455,37 @@ class HeaderRegistry:
             'unsafe-url',
         ]
         
-        def check(value: str) -> HeaderStatus:
+        RESTRICTIVE_POLICIES = ['no-referrer', 'strict-origin', 'strict-origin-when-cross-origin']
+        ACCEPTABLE_POLICIES = ['origin', 'origin-when-cross-origin', 'same-origin']
+        
+        def check(value: str, header_name: str = "") -> HeaderStatus:
             if not value:
                 return HeaderStatus.MISSING
             
-            value_lower = value.lower().strip()
+            # Split by comma for multiple policies (e.g., "origin-when-cross-origin, strict-origin-when-cross-origin")
+            policies = [p.strip() for p in value.lower().split(',')]
             
-            if value_lower in VALID_POLICIES:
-                if value_lower in ['no-referrer', 'strict-origin', 'strict-origin-when-cross-origin']:
-                    return HeaderStatus.PRESENT
-                elif value_lower == 'unsafe-url':
-                    return HeaderStatus.MISCONFIGURED
-                else:
-                    return HeaderStatus.WEAK if value_lower == 'no-referrer-when-downgrade' else HeaderStatus.PRESENT
-            else:
+            # Check if all policies are valid
+            invalid_policies = [p for p in policies if p not in VALID_POLICIES]
+            if invalid_policies:
                 return HeaderStatus.MISCONFIGURED
+            
+            # Check for unsafe-url
+            if 'unsafe-url' in policies:
+                return HeaderStatus.MISCONFIGURED
+            
+            # Check if any restrictive policy is present
+            has_restrictive = any(p in RESTRICTIVE_POLICIES for p in policies)
+            has_acceptable = any(p in ACCEPTABLE_POLICIES for p in policies)
+            
+            if has_restrictive:
+                return HeaderStatus.PRESENT
+            elif has_acceptable:
+                return HeaderStatus.WEAK
+            elif 'no-referrer-when-downgrade' in policies:
+                return HeaderStatus.WEAK
+            
+            return HeaderStatus.WEAK
         
         return SecurityHeader(
             name="referrer-policy",
@@ -473,7 +521,7 @@ class HeaderRegistry:
     def _create_permissions_policy(self) -> SecurityHeader:
         """Create Permissions-Policy header definition"""
         
-        def check(value: str) -> HeaderStatus:
+        def check(value: str, header_name: str = "") -> HeaderStatus:
             if not value:
                 return HeaderStatus.MISSING
             
@@ -523,7 +571,7 @@ class HeaderRegistry:
         
         VALID_VALUES = ['same-origin', 'same-origin-allow-popups', 'unsafe-none']
         
-        def check(value: str) -> HeaderStatus:
+        def check(value: str, header_name: str = "") -> HeaderStatus:
             if not value:
                 return HeaderStatus.MISSING
             
@@ -568,7 +616,7 @@ class HeaderRegistry:
         
         VALID_VALUES = ['same-origin', 'same-site', 'cross-origin']
         
-        def check(value: str) -> HeaderStatus:
+        def check(value: str, header_name: str = "") -> HeaderStatus:
             if not value:
                 return HeaderStatus.MISSING
             
@@ -615,7 +663,7 @@ class HeaderRegistry:
         
         VALID_VALUES = ['require-corp', 'credentialless', 'unsafe-none']
         
-        def check(value: str) -> HeaderStatus:
+        def check(value: str, header_name: str = "") -> HeaderStatus:
             if not value:
                 return HeaderStatus.MISSING
             
@@ -658,7 +706,7 @@ class HeaderRegistry:
     def _create_cache_control(self) -> SecurityHeader:
         """Create Cache-Control header definition"""
         
-        def check(value: str) -> HeaderStatus:
+        def check(value: str, header_name: str = "") -> HeaderStatus:
             if not value:
                 return HeaderStatus.MISSING
             
@@ -712,7 +760,7 @@ class HeaderRegistry:
         
         VALID_VALUES = ['none', 'master-only', 'by-content-type', 'all', 'none']
         
-        def check(value: str) -> HeaderStatus:
+        def check(value: str, header_name: str = "") -> HeaderStatus:
             if not value:
                 return HeaderStatus.MISSING
             
@@ -761,7 +809,7 @@ class HeaderRegistry:
     def _create_expect_ct(self) -> SecurityHeader:
         """Create Expect-CT header definition"""
         
-        def check(value: str) -> HeaderStatus:
+        def check(value: str, header_name: str = "") -> HeaderStatus:
             if not value:
                 return HeaderStatus.MISSING
             
