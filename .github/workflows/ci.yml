@@ -19,14 +19,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-
-      - name: Cache pip packages
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
@@ -38,8 +31,8 @@ jobs:
         run: |
           pytest tests/ -v --cov=src --cov-report=xml --cov-report=html
 
-      - name: Upload coverage
-        uses: codecov/codecov-action@v3
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
         with:
           file: ./coverage.xml
           fail_ci_if_error: false
@@ -58,12 +51,15 @@ jobs:
           python-version: '3.10'
 
       - name: Install linting tools
-        run: pip install flake8 black
+        run: pip install flake8 black isort
 
       - name: Check Python syntax
         run: flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics
 
-      - name: Run black check
+      - name: Check code formatting
+        run: isort --check-only --diff src/ tests/ || true
+
+      - name: Check black formatting
         run: black --check src/ tests/ || true
 
   security-scan:
@@ -86,11 +82,12 @@ jobs:
         run: bandit -r src/ -f json -o security-report.json || true
 
       - name: Upload security report
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: security-report
           path: security-report.json
-        if: always()
+          retention-days: 7
+          if-no-files-found: ignore
 
   build-documentation:
     name: Build Documentation
@@ -104,6 +101,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
       - name: Install dependencies
         run: pip install -r requirements.txt
