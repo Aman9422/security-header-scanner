@@ -1,0 +1,22 @@
+# Core dependencies
+requests>=2.31.0
+click>=8.1.7
+rich>=13.7.0
+pyyaml>=6.0.1
+colorama>=0.4.6
+
+# API framework
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# Data validation
+pydantic>=2.5.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+responses>=0.24.0
+
+# Optional
+jinja2>=3.1.2
+tabulate>=0.9.0

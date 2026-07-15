@@ -1,0 +1,101 @@
+# Security Headers Scanner Configuration
+
+scanner:
+  # Request timeout in seconds
+  timeout: 30
+  
+  # Maximum retry attempts for failed requests
+  max_retries: 3
+  
+  # Delay between requests (rate limiting) in seconds
+  rate_limit_delay: 1.0
+  
+  # Follow HTTP redirects
+  follow_redirects: true
+  
+  # User agent string
+  user_agent: "SecurityHeadersScanner/2.0 (https://github.com/security-header-scanner)"
+  
+  # Maximum URLs per batch scan
+  max_batch_size: 100
+
+# Security headers configuration
+headers:
+  # Minimum required headers
+  required_headers:
+    - strict-transport-security
+    - x-content-type-options
+  
+  # Headers to check (order matters for reporting)
+  check_order:
+    - strict-transport-security
+    - content-security-policy
+    - x-frame-options
+    - x-content-type-options
+    - x-xss-protection
+    - referrer-policy
+    - permissions-policy
+    - cross-origin-opener-policy
+    - cross-origin-resource-policy
+    - cross-origin-embedder-policy
+    - cache-control
+    - x-permitted-cross-domain-policies
+    - expect-ct
+  
+  # Scoring weights
+  scoring:
+    present: 10
+    weak: 5
+    misconfigured: -5
+    missing: -10
+  
+  # Individual header weights (importance)
+  weights:
+    strict-transport-security: 15
+    content-security-policy: 25
+    x-frame-options: 15
+    x-content-type-options: 10
+    referrer-policy: 10
+    permissions-policy: 10
+    cross-origin-opener-policy: 8
+    cross-origin-resource-policy: 5
+    cross-origin-embedder-policy: 5
+    cache-control: 8
+    x-xss-protection: 5
+    x-permitted-cross-domain-policies: 3
+    expect-ct: 5
+
+# Risk thresholds
+thresholds:
+  critical: 0
+  high: 25
+  medium: 50
+  low: 75
+  excellent: 90
+
+# Proxy configuration
+proxy:
+  enabled: false
+  http: null
+  https: null
+  no_proxy: "localhost,127.0.0.1"
+
+# API server settings
+api:
+  host: "0.0.0.0"
+  port: 5000
+  debug: false
+  threaded: true
+
+# Storage settings
+storage:
+  type: "json"  # json, sqlite
+  path: "./data"
+  max_history: 1000
+  auto_cleanup_days: 30
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: null  # Optional log file path
