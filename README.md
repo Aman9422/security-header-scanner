@@ -7,8 +7,7 @@
 [![Tests](https://img.shields.io/badge/Tests-29%20passing-brightgreen.svg)]()
 [![Code Quality](https://img.shields.io/badge/Quality-A%2B-brightgreen.svg)]()
 
-### 📊 Project Status
-✅ **Production Ready** | ✅ **Fully Tested** | ✅ **Recently Audited & Fixed**
+
 
 ---
 
@@ -31,43 +30,36 @@
 
 ---
 
-## 📖 Table of Contents
+## Table of Contents
 
-1. [What is this?](#what-is-this)
-2. [Quick Start (5 minutes)](#-quick-start)
-3. [Installation](#-installation)
-4. [How to Use](#-how-to-use)
-5. [Understanding Results](#-understanding-results)
-6. [For Developers](#-for-developers)
-7. [Publish to GitHub](#-publish-to-github)
+1. [Overview](#overview)
+2. [Features](#-features)
+3. [Quick Start](#-quick-start)
+4. [Installation](#-installation)
+5. [Usage Guide](#usage-guide)
+6. [Assessment Results](#understanding-security-assessment-results)
+7. [Developer Guide](#-for-developers)
+8. [Publishing to GitHub](#publishing-to-github)
+9. [FAQ](#frequently-asked-questions)
 
 ---
 
-## 🎯 What is this?
+## Overview
 
-**Security Headers Scanner Pro** is a tool that checks if a website has proper security headers configured. 
+**Security Headers Scanner Pro** is a comprehensive security assessment tool that validates HTTP security headers, SSL/TLS configuration, and web application security posture. It analyzes websites against industry security standards and best practices.
 
-### Think of it like a security checklist:
+### Key Benefits
 
-| Without Security Headers | With Security Headers |
-|------------------------|----------------------|
-| 😰 Vulnerable to XSS attacks | ✅ Protected from XSS |
-| 😰 Can be clicked-jacked | ✅ Can't be embedded in frames |
-| 😰 Data can be intercepted | ✅ Forces HTTPS encryption |
-| 😰 Browser can guess file types | ✅ File types are enforced |
+| Vulnerability Type | Risk | Mitigation |
+|-------------------|------|------------|
+| Cross-Site Scripting (XSS) | High | Validates Content-Security-Policy |
+| Clickjacking Attacks | High | Enforces X-Frame-Options |
+| Man-in-the-Middle (MITM) | Critical | Validates HSTS & TLS Configuration |
+| MIME Type Sniffing | Medium | Checks X-Content-Type-Options |
 
-### Why does this matter?
+### Purpose
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  When you visit a website, the server sends:            │
-│                                                          │
-│  1. The webpage (HTML)                                   │
-│  2. Security headers (invisible instructions)            │
-│                                                          │
-│  These headers tell browsers HOW to protect users        │
-└─────────────────────────────────────────────────────────┘
-```
+HTTP security headers are critical directives sent by servers to web browsers that instruct them on how to handle content security, encryption, and threat mitigation. Many organizations fail to properly configure these headers, leaving their applications vulnerable to attacks.
 
 ---
 
@@ -111,12 +103,13 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Step 4: Run Your First Scan! 🚀
+### Step 4: Execute Initial Scan
+
 ```bash
 python main.py scan https://example.com
 ```
 
-**That's it!** You'll see something like this:
+Example output:
 
 ```
 ======================================================================
@@ -188,64 +181,62 @@ python main.py scan https://example.com
 
 ---
 
-## 📚 How to Use
+## Usage Guide
 
-### 🔍 Scan a Single Website
+### Single Website Scan
 
 ```bash
 python main.py scan https://google.com
 ```
 
-**Output:** Beautiful text report with:
-- Overall security score
-- List of headers found
-- Missing headers with fixes
-- Risk level assessment
+**Output Includes:**
+- Overall security score (0-100%)
+- Detected security headers with values
+- Missing or misconfigured headers
+- Remediation guidance
 
 ---
 
-### 📊 Generate HTML Report (Pretty Report!)
+### Generate HTML Report
 
 ```bash
 python main.py scan https://google.com --format html --output report.html
 ```
 
-Then open `report.html` in your browser for a beautiful visual report!
+Open the generated `report.html` file in a web browser for detailed visual analysis.
 
 ---
 
-### 📋 Batch Scan (Multiple Websites)
+### Batch Scanning
 
 ```bash
-# Create a file with URLs (one per line)
+# Create file with URLs (one per line)
 cat > urls.txt << EOF
 https://google.com
 https://github.com
 https://apple.com
 EOF
 
-# Scan all at once
+# Execute batch scan
 python main.py batch urls.txt --format json --output results.json
 ```
 
-**Features:**
-- Scan up to 100 URLs simultaneously (configurable)
-- Generates combined report
-- Rate limiting to avoid overwhelming servers
-- Supports all output formats
+**Capabilities:**
+- Process up to 100 URLs (configurable via config.yaml)
+- Rate limiting to respect server resources
+- Consolidated report with all results
+- All output format support
 
----
-
-### 📜 Generate Other Formats
+### Output Format Options
 
 ```bash
-# JSON (for developers/CI-CD)
+# JSON format (for programmatic access)
 python main.py scan https://example.com --format json
 
-# CSV (for Excel/Sheets)
+# CSV format (for data analysis tools)
 python main.py scan https://example.com --format csv
 
-# Markdown (for README files)
+# Markdown format (for documentation)
 python main.py scan https://example.com --format markdown
 ```
 
@@ -329,7 +320,7 @@ Shows all 13 security headers the tool checks for!
 
 ---
 
-### 🔐 Analyze SSL/TLS Certificate
+### SSL/TLS Certificate Analysis
 
 ```bash
 python main.py ssl example.com
@@ -337,77 +328,90 @@ python main.py ssl example.com --port 8443
 python main.py ssl example.com --format json --output ssl_report.json
 ```
 
-**Output:** Certificate info, TLS version, cipher suite, expiration warnings, grade
+**Output Includes:**
+- Certificate validity and expiration status
+- TLS protocol version and cipher suite details
+- Key size and signature algorithm information
+- Configuration grade and security assessment
 
 ---
 
-### 🔎 Detect Technologies Used
+### Technology Detection
 
 ```bash
 python main.py fingerprint https://example.com
 python main.py fingerprint https://example.com --format json
 ```
 
-**Output:** Detects:
-- Frontend frameworks (React, Vue, Angular, etc.)
-- Backend technologies (Node.js, Django, PHP, etc.)
-- CMS platforms (WordPress, Drupal, etc.)
-- JavaScript libraries
-- Server software
+**Detection Capabilities:**
+- Frontend frameworks (React, Vue, Angular, Svelte, etc.)
+- Backend technologies (Node.js, Django, PHP, Ruby, etc.)
+- Content Management Systems (WordPress, Drupal, Joomla, etc.)
+- Client-side JavaScript libraries and frameworks
+- Server software and versions
 
 ---
 
-### 🌐 Discover Subdomains
+### Subdomain Enumeration
 
 ```bash
 python main.py subdomains example.com
-python main.py subdomains example.com --quick    # Fast scan
+python main.py subdomains example.com --quick    # Fast scan (50 concurrent workers)
 python main.py subdomains example.com --format json
 ```
 
-**Output:** Live subdomains, IP addresses, detected services
+**Output Includes:**
+- Enumerated subdomains with alive/dead status
+- Resolved IP addresses
+- Detected network services per subdomain
 
 ---
 
-### 📁 Scan for Sensitive Directories
+### Sensitive Directory and File Discovery
 
 ```bash
 python main.py dirs https://example.com
-python main.py dirs https://example.com --quick  # Sensitive paths only
+python main.py dirs https://example.com --quick  # Restricted to sensitive paths
 python main.py dirs https://example.com --format json
 ```
 
-**Output:** Exposed directories, sensitive files, access levels
+**Output Includes:**
+- Discovered directories and file paths
+- HTTP response status codes
+- Accessible sensitive files and configuration endpoints
 
 ---
 
-### 🛡️ Complete Security Audit (All Checks)
+### Comprehensive Security Audit
 
-Runs all 5 scans in one command:
+Executes all security assessments in a single operation:
 
 ```bash
 python main.py audit https://example.com
 python main.py audit https://example.com --format json --output full_audit.json
 ```
 
-**Includes:**
-1. Security headers analysis
-2. SSL/TLS certificate check
-3. Technology fingerprinting
-4. Subdomain discovery
-5. Directory scanning
+**Assessment Modules:**
+1. HTTP Security Headers validation
+2. SSL/TLS Certificate and protocol analysis
+3. Technology stack fingerprinting
+4. Subdomain enumeration and verification
+5. Sensitive directory and path discovery
 
-**Output:** Comprehensive report with overall security score and critical findings
+**Output:**
+- Consolidated security assessment report
+- Overall risk score and grade
+- Critical findings and remediation recommendations
 
 ---
 
-### 📖 Full Command Reference
+### Command Reference
 
 ```bash
-# List all available commands
+# Display all available commands
 python main.py --help
 
-# View help for specific command
+# Display command-specific usage information
 python main.py scan --help
 python main.py ssl --help
 python main.py audit --help
@@ -501,112 +505,95 @@ api:
 
 ---
 
-## 🚀 Publish to GitHub
+## Publishing to GitHub
 
-### Step 1: Create Repository on GitHub
+### Repository Setup
 
-1. Go to: **https://github.com/new**
-2. Repository name: `security-header-scanner`
-3. Select: **Public**
-4. Click: **Create repository**
+1. Navigate to [GitHub new repository](https://github.com/new)
+2. Configure repository:
+   - Repository name: `security-header-scanner`
+   - Visibility: Public
+   - Initialize with: None (push existing code)
 
-### Step 2: Push Your Code
+### Initial Commit and Push
 
 ```bash
 cd security-header-scanner
 
-# Initialize git
 git init
-
-# Add all files
 git add .
-
-# Create first commit
 git commit -m "Initial commit: Security Headers Scanner Pro"
-
-# Connect to GitHub
-git remote add origin https://github.com/YOUR_USERNAME/security-header-scanner.git
-
-# Push!
 git branch -M main
+git remote add origin https://github.com/YOUR_USERNAME/security-header-scanner.git
 git push -u origin main
 ```
 
-### Step 3: Enable GitHub Actions
+### Continuous Integration
 
-After pushing, GitHub will automatically:
-- ✅ Run tests on every push
-- ✅ Check code quality
-- ✅ Generate coverage reports
-
----
-
-## 🔄 Recent Updates & Improvements
-
-### Version 2.0 - Recent Quality Improvements ✨
-
-**Audit & Fixes (Latest):**
-- ✅ Fixed missing `datetime` import in `audit` command
-- ✅ Removed 11 unused imports for cleaner code
-- ✅ Comprehensive code audit completed
-- ✅ All 29 tests passing
-- ✅ Code quality: A+
-
-**Features Added:**
-- ✅ Complete security audit command (`audit`)
-- ✅ Multi-format report generation (HTML, JSON, CSV, Markdown)
-- ✅ CVSS vulnerability scoring system
-- ✅ REST API server with Flask
-- ✅ Batch scanning support
-- ✅ Technology fingerprinting
-- ✅ Subdomain discovery
-- ✅ Directory scanning
-
-**Documentation:**
-- ✅ Comprehensive README with all commands
-- ✅ Inline code documentation & docstrings
-- ✅ Example URLs provided
-- ✅ Configuration guide
+After pushing to GitHub, enable the following automations:
+- Automated test execution on push
+- Code quality checks
+- Coverage report generation
 
 ---
 
-## ❓ Common Questions
+## Version History and Recent Updates
 
-### Q: Is this free?
-**A:** Yes! MIT License - free to use, modify, and distribute.
+### v2.0 - Code Quality and Documentation Improvements
 
-### Q: Can I use this commercially?
-**A:** Yes! Just keep the copyright notice.
+**Critical Fixes:**
+- Fixed missing `datetime` import in audit command
+- Removed 11 unused imports for improved code cleanliness
+- Comprehensive code audit and quality verification
+- All 29 unit tests passing
+- Code quality assessment: A+
 
-### Q: Does this scan my local website?
-**A:** Yes! Use localhost or your local IP:
-```bash
-python main.py scan http://localhost:3000
-```
+**New Features:**
+- Complete security audit command integrating all scanners
+- Multi-format report generation (Text, JSON, HTML, CSV, Markdown)
+- CVSS v3.1 vulnerability scoring system
+- REST API server with Flask framework
+- Batch scanning capabilities
+- Technology stack fingerprinting
+- Subdomain enumeration and verification
+- Sensitive directory discovery
 
-### Q: How accurate is it?
-**A:** Very! It validates headers against real browser behavior and security standards.
-
-### Q: Can I add more headers?
-**A:** Yes! Edit `src/headers.py` to add new headers.
-
----
-
-## 🙏 Credits
-
-- Security header definitions based on [OWASP](https://owasp.org/)
-- Scoring inspired by [Mozilla Observatory](https://observatory.mozilla.org/)
-- Built with ❤️ for the developer community
-
----
-
-## 📄 License
-
-MIT License - see [LICENSE](LICENSE) file for details.
+**Documentation Improvements:**
+- Comprehensive README with all command documentation
+- Inline code documentation and docstrings
+- Sample URLs and configuration examples
+- Developer guide with module structure
 
 ---
 
-**Made with ❤️ by Aman9422**
+## Frequently Asked Questions
 
-[![Star this repo](https://img.shields.io/github/stars/Aman9422/security-header-scanner?style=social)](https://github.com/Aman9422/security-header-scanner)
-[![Follow on GitHub](https://img.shields.io/github/followers/Aman9422?style=social)](https://github.com/Aman9422)
+**Q: What is the license?**  
+A: MIT License - free to use, modify, and distribute for both personal and commercial purposes.
+
+**Q: Can this be used for commercial applications?**  
+A: Yes, the MIT License permits commercial use. Attribution of the original copyright holder is required.
+
+**Q: Does the scanner support local networks?**  
+A: Yes. Use localhost or internal IP addresses with the scan command.
+
+**Q: How accurate are the assessments?**  
+A: The scanner validates headers against W3C standards and OWASP recommendations.
+
+**Q: Can custom headers be added?**  
+A: Yes. Edit `src/headers.py` to add new security header definitions.
+
+**Q: Is rate limiting available?**  
+A: Yes, configurable via `config.yaml`.
+
+## References and Resources
+
+- [OWASP Secure Headers Project](https://owasp.org/www-project-secure-headers/)
+- [Mozilla Observatory](https://observatory.mozilla.org/)
+- [CVSS v3.1 Specification](https://www.first.org/cvss/v3.1/specification-document)
+- [HTTP Header Security Best Practices](https://portswigger.net/web-security)
+- [W3C Content Security Policy Specification](https://w3c.github.io/webappsec-csp/)
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) file for complete terms and conditions.
