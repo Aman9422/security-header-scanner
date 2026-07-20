@@ -15,13 +15,15 @@ A comprehensive security audit tool that checks:
 import sys
 import os
 from pathlib import Path
+from datetime import datetime
+from urllib.parse import urlparse
 
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
 import click
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 from rich.panel import Panel
 from rich import box
@@ -32,8 +34,7 @@ from src.ssl_analyzer import SSLAnalyzer
 from src.fingerprinter import TechnologyFingerprinter
 from src.subdomain_scanner import SubdomainScanner
 from src.directory_scanner import DirectoryScanner
-from src.cvss_scoring import CVSSCalculator, Severity, AttackVector, AttackComplexity, PrivilegesRequired, UserInteraction, Scope, CIA
-from src.reporter import ReportGenerator, BatchReportGenerator
+from src.reporter import ReportGenerator
 from src.storage import get_storage
 from src.headers import HeaderStatus
 
@@ -645,7 +646,6 @@ def serve(host: str, port: int):
 
 def main():
     """Main entry point"""
-    import datetime
     try:
         cli()
     except KeyboardInterrupt:
