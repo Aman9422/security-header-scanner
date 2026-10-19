@@ -128,6 +128,10 @@ class TestScanner:
         score = scanner._calculate_header_score(HeaderStatus.WEAK, 15)
         assert score == 7  # 50% of weight, floored
 
+    def test_batch_scan_rejects_empty_input(self, scanner):
+        with pytest.raises(ValueError, match="must not be empty"):
+            scanner.batch_scan([])
+
 
 class TestAnalyzer:
     """Test cases for HeaderAnalyzer"""
@@ -139,9 +143,13 @@ class TestAnalyzer:
     
     def test_calculate_percentage_score(self, analyzer):
         """Test percentage score calculation"""
-        # Normal case: score of 50 out of 100
+        # Signed score scale: 50/100 maps to 75% after shifting [-100, 100]
+        # into the user-facing [0, 100] range.
         score = analyzer.calculate_percentage_score(50, 100)
-        assert score == 50.0  # (50/100)*100 = 50
+        assert score == 75.0
+        assert analyzer.calculate_percentage_score(100, 100) == 100.0
+        assert analyzer.calculate_percentage_score(0, 100) == 50.0
+        assert analyzer.calculate_percentage_score(-100, 100) == 0.0
     
     def test_calculate_percentage_score_zero(self, analyzer):
         """Test percentage with zero max score"""
@@ -167,10 +175,10 @@ class TestAnalyzer:
     
     def test_get_risk_level(self, analyzer):
         """Test risk level assignment"""
-        assert analyzer.get_risk_level(95) == "excellent"
-        assert analyzer.get_risk_level(80) == "good"
+        assert analyzer.get_risk_level(95) == "low"
+        assert analyzer.get_risk_level(80) == "low"
         assert analyzer.get_risk_level(60) == "medium"
-        assert analyzer.get_risk_level(30) == "low"
+        assert analyzer.get_risk_level(30) == "high"
         assert analyzer.get_risk_level(10) == "critical"
 
 

@@ -4,7 +4,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-29%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)]()
 [![Code Quality](https://img.shields.io/badge/Quality-A%2B-brightgreen.svg)]()
 
 
@@ -17,15 +17,15 @@
 
 | Feature | Description | Command |
 |---------|-------------|---------|
-| 🔐 **Security Headers** | Checks 13+ security headers | `scan` |
+| 🔐 **Security Headers** | Checks 9 modern security headers by default | `scan` |
 | 🔒 **SSL/TLS Analysis** | Certificate & protocol validation | `ssl` |
 | 🔎 **Tech Fingerprinting** | Identifies frameworks & libraries | `fingerprint` |
 | 🌐 **Subdomain Discovery** | Finds associated subdomains | `subdomains` |
 | 📁 **Directory Scanning** | Detects exposed directories | `dirs` |
 | 🛡️ **Full Audit** | Complete security assessment | `audit` |
 | 📊 **Multiple Reports** | Text, JSON, HTML, CSV, Markdown | `--format` |
-| 📈 **Scoring & Grading** | CVSS-based vulnerability scoring | Built-in |
-| 💾 **History & Storage** | Save & retrieve scan results | `history` |
+| 📈 **Scoring & Grading** | Weighted 0–100 security-header scores | Built-in |
+| 💾 **History & Storage** | Save & retrieve scan results | REST API |
 | 🔌 **REST API** | Programmatic access | `serve` |
 
 ---
@@ -207,25 +207,18 @@ Open the generated `report.html` file in a web browser for detailed visual analy
 
 ---
 
-### Batch Scanning
+### Batch Scanning (REST API)
+
+Batch scanning is available through the authenticated API (there is no `main.py batch` CLI command):
 
 ```bash
-# Create file with URLs (one per line)
-cat > urls.txt << EOF
-https://google.com
-https://github.com
-https://apple.com
-EOF
-
-# Execute batch scan
-python main.py batch urls.txt --format json --output results.json
+curl -X POST "http://127.0.0.1:5000/api/v1/batch" \
+  -H "Authorization: Bearer $SECURITY_SCANNER_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"urls":["https://example.com","https://example.org"]}'
 ```
 
-**Capabilities:**
-- Process up to 100 URLs (configurable via config.yaml)
-- Rate limiting to respect server resources
-- Consolidated report with all results
-- All output format support
+The API validates every target before starting the batch and returns JSON with per-target results and an average score.
 
 ### Output Format Options
 
@@ -234,44 +227,59 @@ python main.py batch urls.txt --format json --output results.json
 python main.py scan https://example.com --format json
 
 # CSV format (for data analysis tools)
-python main.py scan https://example.com --format csv
+python main.py scan https://example.com --format csv --output report.csv
 
 # Markdown format (for documentation)
-python main.py scan https://example.com --format markdown
+python main.py scan https://example.com --format markdown --output report.md
 ```
 
 ---
 
 ### 🔌 Start API Server (For Developers)
 
-Want to integrate with your CI/CD pipeline?
+Want to integrate with your CI/CD pipeline? Configure bearer tokens before starting the server. The API fails closed when no tokens are configured.
 
 ```bash
-# Start the API server
+export SECURITY_SCANNER_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export SECURITY_SCANNER_READ_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export SECURITY_SCANNER_ADMIN_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 python main.py serve
-
-# API will run at: http://localhost:5000
 ```
+
+The server binds to `127.0.0.1:5000` by default. Keep it behind a trusted reverse proxy if you bind it to a network interface. The health check is public; other endpoints require a bearer token. Scanner tokens can scan and read, reader tokens can read history/reports, and admin tokens can also clean up stored scans. `max_urls_per_minute` is enforced per `request.remote_addr` within one process (which may be the reverse proxy's address); configure trusted proxy address handling and a shared gateway limiter for multi-process deployments. API scans resolve and validate destinations again immediately before connecting, pin each socket connection to those validated IP addresses while preserving the requested Host header and TLS hostname verification, ignore ambient proxy variables, and do not follow redirects. Enforce outbound network egress rules as defense in depth.
 
 **API Endpoints:**
 
 | Method | URL | Description |
 |--------|-----|-------------|
-| GET | `/api/v1/scan?url=https://example.com` | Scan a URL |
-| GET | `/api/v1/history` | View scan history |
-| GET | `/api/v1/headers` | List all headers checked |
+| GET | `/api/v1/health` | Public health check |
+| GET / POST | `/api/v1/scan` | Scan one URL; `format` supports `json`, `text`, `html`, `markdown`, `csv` (scanner token) |
+| GET | `/api/v1/history` | View scan history (reader token) |
+| GET | `/api/v1/history/<url>` | View history for a URL (reader token) |
+| GET | `/api/v1/headers` | List headers checked (reader token) |
+| POST | `/api/v1/batch` | Batch scan a JSON `urls` array (scanner token) |
+| POST | `/api/v1/compare` | Compare stored scans by `scan_id_1` and `scan_id_2` (reader token) |
+| POST | `/api/v1/report` | Render a stored scan as JSON, text, HTML, Markdown, or CSV (reader token) |
+| POST | `/api/v1/cleanup` | Delete scans older than `days` (admin token) |
 
 **Example API Call:**
+
 ```bash
-curl "http://localhost:5000/api/v1/scan?url=https://example.com"
+curl -X POST "http://127.0.0.1:5000/api/v1/scan?format=json" \
+  -H "Authorization: Bearer $SECURITY_SCANNER_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com"}'
 ```
 
 ---
 
 ### 📜 View Scan History
 
+History is available from the authenticated API; there is no `python main.py history` CLI command:
+
 ```bash
-python main.py history
+curl "http://127.0.0.1:5000/api/v1/history" \
+  -H "Authorization: Bearer $SECURITY_SCANNER_READ_TOKEN"
 ```
 
 ---
@@ -282,7 +290,7 @@ python main.py history
 python main.py headers
 ```
 
-Shows all 13 security headers the tool checks for!
+Shows the nine modern security headers checked by default.
 
 ---
 
@@ -486,7 +494,7 @@ pytest tests/test_scanner.py::TestHeaderValidation -v
 pytest tests/ -v --durations=10
 ```
 
-**Test Status:** ✅ 29 tests passing | ✅ All modules tested | ✅ 0 failures
+**Test Status:** Run `pytest tests/` to execute the complete regression suite.
 
 ### Configuration
 
@@ -499,9 +507,21 @@ scanner:
   rate_limit_delay: 1.0 # Delay between requests
 
 api:
-  host: "0.0.0.0"
+  host: "127.0.0.1" # Local-only by default; expose only behind a protected proxy
   port: 5000
+  cors_origins: []
+  allow_private_networks: false
+  max_request_bytes: 1048576
+  max_urls_per_minute: 30
+
+storage:
+  type: "json"       # json or sqlite
+  path: "./data"     # JSON directory; SQLite accepts a database file or directory
+  max_history: 1000   # Set to null to disable the count cap
+  auto_cleanup_days: 30 # Set to null to disable age-based cleanup
 ```
+
+JSON index updates are atomic and locked; JSON data files and SQLite databases use owner-only POSIX permissions. SQLite uses WAL and busy timeouts for concurrent workers. Retention settings are applied on startup and after new scans.
 
 ---
 

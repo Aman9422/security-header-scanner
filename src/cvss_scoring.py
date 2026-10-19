@@ -7,6 +7,7 @@ Reference: https://www.first.org/cvss/
 """
 
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_CEILING
 from typing import Dict, List, Optional, Any
 from enum import Enum
 
@@ -77,13 +78,13 @@ class CVSSScore:
     
     # Calculated Scores
     base_score: float
-    temporal_score: float
-    environmental_score: float
+    temporal_score: Optional[float]
+    environmental_score: Optional[float]
     
     # Ratings
     base_severity: Severity
-    temporal_severity: Severity
-    environmental_severity: Severity
+    temporal_severity: Optional[Severity]
+    environmental_severity: Optional[Severity]
     
     # Detailed breakdown
     impact_score: float
@@ -93,8 +94,8 @@ class CVSSScore:
         return {
             "vector_string": self.vector_string,
             "base_score": round(self.base_score, 1),
-            "temporal_score": round(self.temporal_score, 1),
-            "environmental_score": round(self.environmental_score, 1),
+            "temporal_score": round(self.temporal_score, 1) if self.temporal_score is not None else None,
+            "environmental_score": round(self.environmental_score, 1) if self.environmental_score is not None else None,
             "base_severity": self.base_severity.value,
             "impact_score": round(self.impact_score, 2),
             "exploitability_score": round(self.exploitability_score, 2),
@@ -226,25 +227,17 @@ class CVSSCalculator:
             user_interaction, scope
         )
         
-        # Calculate base score
-        if scope == Scope.UNCHANGED:
-            if impact <= 0:
-                base_score = 0
-            else:
-                base_score = min(1.08 * (impact + exploitability), 10)
+        # CVSS v3.1 base score formula and mandated round-up to one decimal.
+        if impact <= 0:
+            base_score = 0.0
+        elif scope == Scope.UNCHANGED:
+            base_score = self._roundup(min(impact + exploitability, 10.0))
         else:
-            if impact <= 0:
-                base_score = 0
-            else:
-                base_score = min(1.08 * (impact + exploitability), 10)
-        
-        base_score = round(base_score, 1)
-        
-        # Temporal score (using default values for simplicity)
-        temporal_score = base_score  # No temporal modifiers
-        
-        # Environmental score (placeholder - would need CR, IR, AR)
-        environmental_score = temporal_score
+            base_score = self._roundup(min(1.08 * (impact + exploitability), 10.0))
+
+        # Temporal/environmental metrics are not supplied by the base vector.
+        temporal_score = None
+        environmental_score = None
         
         # Get severities
         base_severity = self._get_severity(base_score)
@@ -263,8 +256,8 @@ class CVSSCalculator:
             temporal_score=temporal_score,
             environmental_score=environmental_score,
             base_severity=base_severity,
-            temporal_severity=base_severity,
-            environmental_severity=base_severity,
+            temporal_severity=None,
+            environmental_severity=None,
             impact_score=round(impact, 2),
             exploitability_score=round(exploitability, 2),
         )
@@ -316,16 +309,26 @@ class CVSSCalculator:
         )
     
     def _parse_vector(self, vector: str) -> Dict[str, str]:
-        """Parse vector string into metrics"""
-        if vector.startswith("CVSS:"):
-            vector = vector[5:]
-        
-        metrics = {}
-        for part in vector.split("/"):
-            if ":" in part:
-                key, value = part.split(":", 1)
-                metrics[key] = value
-        
+        """Parse and strictly validate a complete CVSS v3.1 base vector."""
+        if not isinstance(vector, str) or len(vector) > 256 or not vector.startswith("CVSS:3.1/"):
+            raise ValueError("Only complete CVSS:3.1 base vectors up to 256 characters are supported")
+
+        required = {"AV", "AC", "PR", "UI", "S", "C", "I", "A"}
+        metrics: Dict[str, str] = {}
+        for part in vector[len("CVSS:3.1/"):].split("/"):
+            if part.count(":") != 1:
+                raise ValueError(f"Invalid CVSS metric: {part!r}")
+            key, value = part.split(":", 1)
+            if key in metrics:
+                raise ValueError(f"Duplicate CVSS metric: {key}")
+            metrics[key] = value
+
+        missing = required - metrics.keys()
+        unsupported = metrics.keys() - required
+        if missing:
+            raise ValueError(f"Missing required CVSS metrics: {', '.join(sorted(missing))}")
+        if unsupported:
+            raise ValueError(f"Unsupported CVSS metrics: {', '.join(sorted(unsupported))}")
         return metrics
     
     def _calculate_impact(
@@ -340,12 +343,15 @@ class CVSSCalculator:
         i_val = self.CIA_WEIGHTS[i]
         a_val = self.CIA_WEIGHTS[a]
         
+        iss = 1 - ((1 - c_val) * (1 - i_val) * (1 - a_val))
         if scope == Scope.UNCHANGED:
-            impact = 1 - ((1 - c_val) * (1 - i_val) * (1 - a_val))
-        else:
-            impact = 6.42 * (1 - (1 - c_val) * (1 - i_val) * (1 - a_val))
-        
-        return impact
+            return 6.42 * iss
+        return 7.52 * (iss - 0.029) - 3.25 * ((iss - 0.02) ** 15)
+
+    @staticmethod
+    def _roundup(score: float) -> float:
+        """Apply CVSS v3.1's round-up rule to one decimal place."""
+        return float(Decimal(str(score)).quantize(Decimal("0.1"), rounding=ROUND_CEILING))
     
     def _calculate_exploitability(
         self,

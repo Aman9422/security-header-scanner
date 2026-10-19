@@ -22,6 +22,11 @@ htmlcov/
 # Data files
 data/
 *.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
 
 # Generated reports
 *.html

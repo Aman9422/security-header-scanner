@@ -9,7 +9,7 @@ validation rules, and remediation suggestions.
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, List, Dict, Callable, Any
+from typing import Optional, List, Dict, Callable, Any, Tuple
 
 
 class HeaderStatus(Enum):
@@ -60,7 +60,7 @@ class SecurityHeader:
     category: str = "general"
     aliases: List[str] = field(default_factory=list)
     
-    def validate(self, value: Optional[str], header_name: str = "") -> tuple[HeaderStatus, Dict[str, Any]]:
+    def validate(self, value: Optional[str], header_name: str = "") -> Tuple[HeaderStatus, Dict[str, Any]]:
         """Validate header value and return status with details"""
         if value is None:
             return HeaderStatus.MISSING, {}
@@ -91,15 +91,11 @@ class HeaderRegistry:
             self._create_content_security_policy(),
             self._create_x_frame_options(),
             self._create_x_content_type_options(),
-            self._create_x_xss_protection(),
             self._create_referrer_policy(),
             self._create_permissions_policy(),
             self._create_cross_origin_opener_policy(),
             self._create_cross_origin_resource_policy(),
             self._create_cross_origin_embedder_policy(),
-            self._create_cache_control(),
-            self._create_x_permitted_cross_domain_policies(),
-            self._create_expect_ct(),
         ]
         
         for header in headers:
@@ -204,70 +200,55 @@ class HeaderRegistry:
         def check(value: str, header_name: str = "") -> HeaderStatus:
             if not value:
                 return HeaderStatus.MISSING
-            
-            # Check if it's report-only mode (not actively blocking)
-            is_report_only = (
-                value.lower().startswith("report-") or 
-                "report-only" in header_name.lower()
-            )
-            
-            # Check for dangerously permissive patterns (standalone wildcards in quotes)
-            has_dangerous_wildcard = False
-            if re.search(r"[^a-z-] \*[^a-z]", value) or re.search(r"'\s*\*\s*'", value):
-                has_dangerous_wildcard = True
-            
-            # Check for unsafe-eval (without nonce)
-            has_unsafe_eval = "'unsafe-eval'" in value
-            has_nonce = "nonce-" in value.lower()
-            has_hash = "hash-" in value.lower()
-            has_strict_dynamic = "'strict-dynamic'" in value
-            
-            # Modern restrictive directives
-            has_object_src_none = "object-src 'none'" in value or 'object-src "none"' in value
-            has_base_uri_self = "base-uri 'self'" in value or 'base-uri "self"' in value
-            has_default_src_none = "default-src 'none'" in value or 'default-src "none"' in value
-            has_default_src_self = "default-src 'self'" in value or 'default-src "self"' in value
-            
-            # Count specific directives
-            specific_directives = [
-                'default-src', 'script-src', 'style-src', 'img-src', 
-                'font-src', 'connect-src', 'media-src', 'object-src',
-                'base-uri', 'form-action', 'frame-ancestors', 'child-src',
-                'worker-src', 'frame-src'
-            ]
-            directive_count = sum(1 for d in specific_directives if d in value)
-            
-            # Report-only CSP should always be WEAK (not actively blocking)
-            # Even if it has good directives, it's not protecting
-            if is_report_only:
+            if "report-only" in header_name.lower():
                 return HeaderStatus.WEAK
-            
-            # Determine status for active CSP
-            # Has default-src 'none' = PRESENT (most restrictive)
-            if has_default_src_none:
-                return HeaderStatus.PRESENT
-            
-            # Has dangerous wildcard or unsafe-eval without nonce = MISCONFIGURED
-            if (has_dangerous_wildcard or has_unsafe_eval) and not (has_nonce or has_hash):
+
+            directives: Dict[str, List[str]] = {}
+            for raw_directive in value.split(";"):
+                parts = raw_directive.strip().split()
+                if not parts:
+                    continue
+                name = parts[0].lower()
+                if not re.fullmatch(r"[a-z][a-z0-9-]*", name):
+                    return HeaderStatus.MISCONFIGURED
+                # Browsers ignore later duplicate directives; preserve first.
+                directives.setdefault(name, [token.lower() for token in parts[1:]])
+
+            if not directives:
                 return HeaderStatus.MISCONFIGURED
-            
-            # Has object-src 'none' + base-uri 'self' + nonce = PRESENT (Google-style)
-            if has_object_src_none and has_base_uri_self and (has_nonce or has_strict_dynamic):
-                return HeaderStatus.PRESENT
-            
-            # Has default-src 'self' with multiple directives = PRESENT
-            if has_default_src_self and directive_count >= 4:
-                return HeaderStatus.PRESENT
-            
-            # Has nonce with specific script-src = PRESENT
-            if has_nonce and 'script-src' in value:
-                return HeaderStatus.PRESENT
-            
-            # Has multiple specific directives = WEAK
-            if directive_count >= 3:
+
+            source_directives = {
+                "default-src", "script-src", "style-src", "img-src", "font-src",
+                "connect-src", "media-src", "object-src", "frame-src", "child-src",
+                "worker-src", "manifest-src", "prefetch-src",
+            }
+            wildcard_directives = {
+                name for name, tokens in directives.items()
+                if name in source_directives and "*" in tokens
+            }
+            # A wildcard for scripts or the fallback policy is a material weakness.
+            if wildcard_directives & {"default-src", "script-src"}:
+                return HeaderStatus.MISCONFIGURED
+
+            unsafe_tokens = {"'unsafe-inline'", "'unsafe-eval'"}
+            script_effective = directives.get("script-src", directives.get("default-src", []))
+            style_effective = directives.get("style-src", directives.get("default-src", []))
+            if unsafe_tokens.intersection(script_effective) or unsafe_tokens.intersection(style_effective):
                 return HeaderStatus.WEAK
-            
-            # Basic CSP exists but is weak
+            if wildcard_directives:
+                return HeaderStatus.WEAK
+
+            default_sources = directives.get("default-src", [])
+            script_sources = directives.get("script-src", default_sources)
+            if not default_sources and "script-src" not in directives:
+                return HeaderStatus.MISCONFIGURED
+
+            if default_sources == ["'none'"]:
+                return HeaderStatus.PRESENT
+            if script_sources and script_sources != ["'none'"]:
+                return HeaderStatus.PRESENT
+            if default_sources:
+                return HeaderStatus.WEAK
             return HeaderStatus.WEAK
         
         return SecurityHeader(
@@ -524,21 +505,28 @@ class HeaderRegistry:
         def check(value: str, header_name: str = "") -> HeaderStatus:
             if not value:
                 return HeaderStatus.MISSING
-            
-            # Check for common restricted features
-            restricted_features = [
-                'geolocation', 'camera', 'microphone', 
-                'usb', 'fullscreen', 'payment'
-            ]
-            
-            found_features = [f for f in restricted_features if f in value.lower()]
-            
-            if len(found_features) >= 3:
-                return HeaderStatus.PRESENT
-            elif len(found_features) >= 1:
-                return HeaderStatus.WEAK
-            else:
-                return HeaderStatus.WEAK  # Policy exists but no restrictions
+
+            restricted_features = 0
+            parsed_features = 0
+            for directive in re.split(r"[,;]", value):
+                directive = directive.strip()
+                if not directive:
+                    continue
+                match = re.fullmatch(r"([a-z][a-z0-9-]*)\s*=\s*(.+)", directive, re.IGNORECASE)
+                if not match:
+                    return HeaderStatus.MISCONFIGURED
+                parsed_features += 1
+                allowlist = match.group(2).strip().lower()
+                # Empty and explicit allowlists restrict who can use a feature.
+                if allowlist == "()" or allowlist == "(self)" or (
+                    allowlist.startswith("(") and allowlist.endswith(")")
+                    and "*" not in allowlist
+                ):
+                    restricted_features += 1
+
+            if parsed_features == 0:
+                return HeaderStatus.MISCONFIGURED
+            return HeaderStatus.PRESENT if restricted_features >= 3 else HeaderStatus.WEAK
         
         return SecurityHeader(
             name="permissions-policy",

@@ -32,15 +32,11 @@ headers:
     - content-security-policy
     - x-frame-options
     - x-content-type-options
-    - x-xss-protection
     - referrer-policy
     - permissions-policy
     - cross-origin-opener-policy
     - cross-origin-resource-policy
     - cross-origin-embedder-policy
-    - cache-control
-    - x-permitted-cross-domain-policies
-    - expect-ct
   
   # Scoring weights
   scoring:
@@ -60,10 +56,6 @@ headers:
     cross-origin-opener-policy: 8
     cross-origin-resource-policy: 5
     cross-origin-embedder-policy: 5
-    cache-control: 8
-    x-xss-protection: 5
-    x-permitted-cross-domain-policies: 3
-    expect-ct: 5
 
 # Risk thresholds
 thresholds:
@@ -71,7 +63,6 @@ thresholds:
   high: 25
   medium: 50
   low: 75
-  excellent: 90
 
 # Proxy configuration
 proxy:
@@ -82,17 +73,23 @@ proxy:
 
 # API server settings
 api:
-  host: "0.0.0.0"
+  # Local-only by default. Exposing this service requires bearer tokens and
+  # explicit network/CORS policy.
+  host: "127.0.0.1"
   port: 5000
   debug: false
   threaded: true
+  cors_origins: []
+  allow_private_networks: false
+  max_request_bytes: 1048576
+  max_urls_per_minute: 30
 
 # Storage settings
 storage:
-  type: "json"  # json, sqlite
-  path: "./data"
-  max_history: 1000
-  auto_cleanup_days: 30
+  type: "json"  # json or sqlite
+  path: "./data"  # JSON directory; SQLite file path or directory (uses scans.db)
+  max_history: 1000  # Set to null for no count-based cap
+  auto_cleanup_days: 30  # Set to null to disable age-based retention
 
 # Logging
 logging:

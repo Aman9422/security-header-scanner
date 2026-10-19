@@ -1,5 +1,6 @@
 # Core dependencies
 requests>=2.31.0
+urllib3>=1.26.18,<3
 click>=8.1.7
 rich>=13.7.0
 pyyaml>=6.0.1
@@ -9,6 +10,9 @@ beautifulsoup4>=4.12.0
 # API framework
 flask>=3.0.0
 flask-cors>=4.0.0
+
+# Certificate parsing
+cryptography>=42.0.0
 
 # Data validation
 pydantic>=2.5.0

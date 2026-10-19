@@ -6,16 +6,19 @@ Common utility functions for the security header scanner.
 """
 
 import hashlib
+import ipaddress
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 import json
 
 
 def generate_id() -> str:
-    """Generate a unique scan ID"""
-    return str(uuid.uuid4())[:8]
+    """Generate a collision-resistant, UUID-based scan ID."""
+    return str(uuid.uuid4())
 
 
 def format_timestamp(dt: Optional[datetime] = None) -> str:
@@ -25,14 +28,64 @@ def format_timestamp(dt: Optional[datetime] = None) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def normalize_http_url(url: str, default_scheme: str = "https") -> str:
+    """Validate and canonicalize an HTTP(S) URL, optionally adding a scheme."""
+    if not isinstance(url, str) or not url.strip() or len(url) > 2048:
+        raise ValueError("URL must be a non-empty string of at most 2048 characters")
+    if any(ord(character) < 32 or ord(character) == 127 for character in url):
+        raise ValueError("URL contains control characters")
+    if default_scheme not in {"http", "https"}:
+        raise ValueError("Default scheme must be http or https")
+
+    value = url.strip()
+    if value.startswith("//"):
+        value = f"{default_scheme}:{value}"
+    elif "://" not in value:
+        value = f"{default_scheme}://{value}"
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("URL or port is invalid") from exc
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError("Only HTTP(S) URLs are supported")
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        raise ValueError("URL must include a hostname and must not include credentials")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("URL port must be between 1 and 65535")
+
+    hostname = parsed.hostname.rstrip(".")
+    try:
+        hostname = hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise ValueError("Invalid internationalized hostname") from exc
+    if ":" in hostname:
+        if "%" in hostname:
+            raise ValueError("Scoped IPv6 addresses are not supported")
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError as exc:
+            raise ValueError("Invalid IP address") from exc
+        host_part = f"[{hostname}]"
+    else:
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            labels = hostname.split(".")
+            if len(hostname) > 253 or any(
+                not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+                for label in labels
+            ):
+                raise ValueError("Invalid DNS hostname")
+        host_part = hostname
+    netloc = f"{host_part}:{port}" if port is not None else host_part
+    return urlunsplit((scheme, netloc, parsed.path, parsed.query, ""))
+
+
 def normalize_url(url: str) -> str:
-    """Normalize URL by adding scheme if missing"""
-    url = url.strip()
-    if not url:
-        return ""
-    if not url.startswith(("http://", "https://", "//")):
-        url = "https://" + url
-    return url
+    """Normalize a website URL by adding HTTPS when no scheme is provided."""
+    return normalize_http_url(url)
 
 
 def get_color_for_status(status: str) -> str:
@@ -125,7 +178,10 @@ def parse_urls_from_file(filepath: str) -> List[str]:
                         else:
                             url = line
                         if url:
-                            urls.append(normalize_url(url))
+                            try:
+                                urls.append(normalize_url(url))
+                            except ValueError:
+                                continue
     except Exception:
         pass
     return urls
