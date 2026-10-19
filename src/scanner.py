@@ -5,12 +5,14 @@ Security Header Scanner Engine
 Core scanning functionality for analyzing security headers.
 """
 
+import math
+import threading
 import time
 import requests
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Any
-from urllib.parse import urlparse
+from typing import Callable, Dict, List, Optional, Any, Tuple
+from urllib.parse import urlsplit
 
 from .headers import (
     SecurityHeader,
@@ -21,7 +23,8 @@ from .headers import (
     Severity
 )
 from .analyzer import HeaderAnalyzer
-from .utils import generate_id, normalize_url, format_timestamp
+from .utils import generate_id, normalize_http_url, format_timestamp
+from .pinned_http import PinnedAddressAdapter
 
 
 @dataclass
@@ -177,6 +180,9 @@ class SecurityHeaderScanner:
         rate_limit_delay: float = 1.0,
         registry: Optional[HeaderRegistry] = None,
         analyzer: Optional[HeaderAnalyzer] = None,
+        max_batch_size: int = 100,
+        trust_env: bool = True,
+        address_resolver: Optional[Callable[[str, int], List[str]]] = None,
     ):
         """
         Initialize the security header scanner.
@@ -189,81 +195,115 @@ class SecurityHeaderScanner:
             rate_limit_delay: Delay between requests in seconds
             registry: Custom header registry (uses default if None)
             analyzer: Custom header analyzer (uses default if None)
+            max_batch_size: Maximum number of targets accepted by batch_scan
+            address_resolver: Optional resolver returning validated IPs to pin on connect
         """
-        self.timeout = timeout
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0.1 <= timeout <= 300:
+            raise ValueError("timeout must be between 0.1 and 300 seconds")
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int) or not 1 <= max_retries <= 10:
+            raise ValueError("max_retries must be an integer between 1 and 10")
+        if isinstance(rate_limit_delay, bool) or not isinstance(rate_limit_delay, (int, float)) or not math.isfinite(rate_limit_delay) or not 0 <= rate_limit_delay <= 60:
+            raise ValueError("rate_limit_delay must be between 0 and 60 seconds")
+        if isinstance(max_batch_size, bool) or not isinstance(max_batch_size, int) or not 1 <= max_batch_size <= 1000:
+            raise ValueError("max_batch_size must be an integer between 1 and 1000")
+        if not isinstance(follow_redirects, bool):
+            raise ValueError("follow_redirects must be a boolean")
+        if not isinstance(trust_env, bool):
+            raise ValueError("trust_env must be a boolean")
+        if address_resolver is not None and not callable(address_resolver):
+            raise ValueError("address_resolver must be callable")
+        if user_agent is None:
+            user_agent = "SecurityHeadersScanner/2.0"
+        if (
+            not isinstance(user_agent, str)
+            or not user_agent.strip()
+            or len(user_agent) > 256
+            or any(ord(character) < 32 or ord(character) == 127 for character in user_agent)
+        ):
+            raise ValueError("user_agent must be a printable string of at most 256 characters")
+
+        self.timeout = float(timeout)
         self.max_retries = max_retries
-        self.user_agent = user_agent or "SecurityHeadersScanner/2.0"
+        self.user_agent = user_agent.strip()
         self.follow_redirects = follow_redirects
-        self.rate_limit_delay = rate_limit_delay
+        self.trust_env = trust_env
+        self.address_resolver = address_resolver
+        self.rate_limit_delay = float(rate_limit_delay)
+        self.max_batch_size = max_batch_size
         self.registry = registry or DEFAULT_HEADER_REGISTRY
         self.analyzer = analyzer or HeaderAnalyzer()
-        
         self._last_request_time = 0.0
+        self._rate_lock = threading.Lock()
         self._seen_headers: set = set()  # Track seen headers to avoid duplicates
     
     def _rate_limit(self):
-        """Apply rate limiting between requests"""
-        elapsed = time.time() - self._last_request_time
-        if elapsed < self.rate_limit_delay:
-            time.sleep(self.rate_limit_delay - elapsed)
-        self._last_request_time = time.time()
+        """Apply thread-safe spacing between outbound requests."""
+        with self._rate_lock:
+            now = time.monotonic()
+            wait = self.rate_limit_delay - (now - self._last_request_time)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request_time = time.monotonic()
     
     def _normalize_url(self, url: str) -> str:
-        """Normalize and validate URL"""
-        url = url.strip()
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-        return url
+        """Normalize and validate an HTTP(S) scan URL."""
+        return normalize_http_url(url)
     
-    def _get_response_headers(self, url: str) -> tuple[Optional[int], Dict[str, str], Optional[str], Optional[str]]:
+    def _get_response_headers(self, url: str) -> Tuple[Optional[int], Dict[str, str], Optional[str], Optional[str]]:
         """
-        Fetch headers from URL using GET request (more reliable than HEAD).
-        
+        Fetch response headers with a bounded body and explicit proxy policy.
+
         Returns:
             Tuple of (status_code, headers_dict, final_url, error_message)
         """
         self._rate_limit()
-        
-        request_headers = {"User-Agent": self.user_agent}
-        
-        for attempt in range(self.max_retries):
-            try:
-                # Use GET request - more reliable for getting all headers
-                # Some servers don't return security headers on HEAD requests
-                response = requests.get(
-                    url,
-                    headers=request_headers,
-                    timeout=self.timeout,
-                    allow_redirects=self.follow_redirects,
-                    verify=True,
-                    stream=True,  # Don't download body
-                )
-                
-                # Convert headers to lowercase keys
-                normalized_headers = {
-                    k.lower(): v for k, v in response.headers.items()
-                }
-                
-                return (
-                    response.status_code,
-                    normalized_headers,
-                    response.url,
-                    None
-                )
-                
-            except requests.exceptions.Timeout:
-                error = f"Request timeout after {self.timeout}s"
-            except requests.exceptions.ConnectionError as e:
-                error = f"Connection error: {str(e)}"
-            except requests.exceptions.RequestException as e:
-                error = f"Request error: {str(e)}"
-            except Exception as e:
-                error = f"Unexpected error: {str(e)}"
-            
-            if attempt < self.max_retries - 1:
-                time.sleep(0.5 * (attempt + 1))  # Exponential backoff
-        
-        return None, {}, None, error
+        session = requests.Session()
+        session.trust_env = self.trust_env
+        session.headers.update({"User-Agent": self.user_agent})
+        try:
+            if self.address_resolver is not None:
+                parsed_url = urlsplit(url)
+                host = parsed_url.hostname
+                port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
+                if not host:
+                    raise ValueError("Pinned scan URL must include a hostname")
+                addresses = self.address_resolver(host, port)
+                adapter = PinnedAddressAdapter(host, port, addresses)
+                session.mount("http://", adapter)
+                session.mount("https://", adapter)
+        except Exception:
+            session.close()
+            raise
+        error = "Request failed"
+        try:
+            for attempt in range(self.max_retries):
+                try:
+                    response = session.get(
+                        url,
+                        timeout=self.timeout,
+                        allow_redirects=self.follow_redirects,
+                        verify=True,
+                        stream=True,
+                    )
+                    try:
+                        normalized_headers = {key.lower(): value for key, value in response.headers.items()}
+                        return response.status_code, normalized_headers, response.url, None
+                    finally:
+                        response.close()
+                except requests.exceptions.Timeout:
+                    error = f"Request timeout after {self.timeout}s"
+                except requests.exceptions.ConnectionError as exc:
+                    error = f"Connection error: {exc}"
+                except requests.exceptions.RequestException as exc:
+                    error = f"Request error: {exc}"
+                except Exception as exc:
+                    error = f"Unexpected error: {exc}"
+
+                if attempt < self.max_retries - 1:
+                    time.sleep(0.5 * (attempt + 1))
+            return None, {}, None, error
+        finally:
+            session.close()
     
     def _find_security_header(self, header_name: str, headers: Dict[str, str]) -> Optional[str]:
         """Find a security header value in response headers"""
@@ -424,7 +464,9 @@ class SecurityHeaderScanner:
                 scan_duration_ms=(time.time() - start_time) * 1000,
                 http_status_code=status_code,
                 final_url=final_url,
-                headers_found=headers,
+                # Store only security-relevant response headers. Persisting all
+                # response headers can retain session cookies or other secrets.
+                headers_found=security_headers,
                 header_results=header_results,
                 total_score=total_score,
                 max_score=max_score,
@@ -453,7 +495,11 @@ class SecurityHeaderScanner:
                 error=str(e),
             )
     
-    def batch_scan(self, urls: List[str], callback: Optional[callable] = None) -> List[ScanResult]:
+    def batch_scan(
+        self,
+        urls: List[str],
+        callback: Optional[Callable[[int, int, ScanResult], None]] = None,
+    ) -> List[ScanResult]:
         """
         Scan multiple URLs.
         
@@ -464,19 +510,23 @@ class SecurityHeaderScanner:
         Returns:
             List of ScanResult objects
         """
+        if not isinstance(urls, (list, tuple)):
+            raise ValueError("urls must be a list or tuple")
+        if not urls:
+            raise ValueError("urls must not be empty")
+        if len(urls) > self.max_batch_size:
+            raise ValueError(f"Batch size exceeds maximum of {self.max_batch_size}")
+        if any(not isinstance(url, str) or not url.strip() for url in urls):
+            raise ValueError("Every batch URL must be a non-empty string")
+        if callback is not None and not callable(callback):
+            raise ValueError("callback must be callable")
         results = []
         
         for i, url in enumerate(urls):
             try:
                 result = self.scan(url)
-                results.append(result)
-                
-                if callback:
-                    callback(i + 1, len(urls), result)
-                    
-            except Exception as e:
-                # Create error result for failed scans
-                error_result = ScanResult(
+            except Exception as exc:
+                result = ScanResult(
                     id=generate_id(),
                     url=url,
                     timestamp=format_timestamp(),
@@ -491,29 +541,57 @@ class SecurityHeaderScanner:
                     grade="F",
                     risk_level="error",
                     summary={"total": 0, "present": 0, "weak": 0, "misconfigured": 0, "missing": 0},
-                    error=str(e),
+                    error=str(exc),
                 )
-                results.append(error_result)
-                
-                if callback:
-                    callback(i + 1, len(urls), error_result)
+            results.append(result)
+            if callback is not None:
+                callback(i + 1, len(urls), result)
         
         return results
     
     def compare_scans(self, scan1: ScanResult, scan2: ScanResult) -> Dict[str, Any]:
-        """
-        Compare two scan results.
-        
-        Returns:
-            Dictionary with comparison details
-        """
+        """Compare scores, raw header presence, and per-header security scores."""
+        if scan1.error or scan2.error:
+            raise ValueError("Failed scans cannot be compared")
+
+        def canonical_header(name: str) -> str:
+            return name.lower().replace("_", "-").strip()
+
+        known_headers = {
+            canonical_header(name) for name in self.SECURITY_HEADERS
+        } | {
+            canonical_header(header.name) for header in self.registry.get_all()
+        }
+        first_found = {
+            canonical_header(name) for name, value in scan1.headers_found.items()
+            if value and canonical_header(name) in known_headers
+        }
+        second_found = {
+            canonical_header(name) for name, value in scan2.headers_found.items()
+            if value and canonical_header(name) in known_headers
+        }
+        first_scores = {canonical_header(header.header_name): header.score for header in scan1.header_results}
+        second_scores = {canonical_header(header.header_name): header.score for header in scan2.header_results}
+
+        improved = []
+        regressed = []
+        for name in sorted(first_scores.keys() | second_scores.keys()):
+            first_score = first_scores.get(name, 0)
+            second_score = second_scores.get(name, 0)
+            if second_score > first_score:
+                improved.append(name)
+            elif second_score < first_score:
+                regressed.append(name)
+
         return {
             "url1": scan1.url,
             "url2": scan2.url,
-            "score_change": scan2.percentage_score - scan1.percentage_score,
+            "score_change": round(scan2.percentage_score - scan1.percentage_score, 1),
             "grade_change": scan2.grade != scan1.grade,
-            "headers_improved": [],
-            "headers_regressed": [],
-            "headers_added": [],
-            "headers_removed": [],
+            "grade_from": scan1.grade,
+            "grade_to": scan2.grade,
+            "headers_improved": improved,
+            "headers_regressed": regressed,
+            "headers_added": sorted(second_found - first_found),
+            "headers_removed": sorted(first_found - second_found),
         }

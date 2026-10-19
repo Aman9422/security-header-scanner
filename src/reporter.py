@@ -5,15 +5,27 @@ Report Generator
 Generate various report formats from scan results.
 """
 
+import csv
+import html
+import io
 import json
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 from jinja2 import Template
+from markupsafe import Markup
 
 from .scanner import ScanResult, HeaderResult
 from .headers import HeaderStatus
 
+
+def _escape_markdown(value: Any) -> str:
+    """Escape untrusted text for common Markdown and raw-HTML renderers."""
+    text = "" if value is None else str(value)
+    text = text.replace("\r", " ").replace("\n", " ").replace("\\", "\\\\")
+    for character in "`*_{}[]()#+!|":
+        text = text.replace(character, "\\" + character)
+    return html.escape(text, quote=False)
 
 class ReportGenerator:
     """
@@ -34,7 +46,7 @@ class ReportGenerator:
         
         Args:
             result: ScanResult object
-            format: Output format (text, json, html, csv)
+            format: Output format (text, json, html, csv, markdown)
             output_path: Optional path to save the report
             
         Returns:
@@ -48,7 +60,9 @@ class ReportGenerator:
             "markdown": self._generate_markdown,
         }
         
-        generator = generators.get(format.lower(), self._generate_text)
+        if not isinstance(format, str) or format.lower() not in generators:
+            raise ValueError(f"Unsupported report format: {format!r}")
+        generator = generators[format.lower()]
         report = generator(result)
         
         if output_path:
@@ -162,7 +176,9 @@ class ReportGenerator:
     
     def _generate_html(self, result: ScanResult) -> str:
         """Generate HTML report"""
-        template = Template(self.html_template)
+        # Autoescape all normal template values. The prebuilt rows below are
+        # marked safe only after every untrusted field has been HTML-escaped.
+        template = Template(self.html_template, autoescape=True)
         
         # Prepare header rows
         header_rows = []
@@ -177,20 +193,23 @@ class ReportGenerator:
             
             remediation = ""
             if h.status != HeaderStatus.PRESENT and h.remediation:
+                action = html.escape(str(h.remediation.action), quote=True)
+                example = html.escape(str(h.remediation.example), quote=True)
                 remediation = f"""
                 <div class="remediation">
-                    <strong>Remediation:</strong> {h.remediation.action}<br>
-                    <code>{h.remediation.example}</code>
+                    <strong>Remediation:</strong> {action}<br>
+                    <code>{example}</code>
                 </div>
                 """
-            
+            display_name = html.escape(str(h.display_name), quote=True)
+            value = html.escape(str(h.value), quote=True) if h.value is not None else "-"
             header_rows.append(f"""
             <tr class="{status_class}">
                 <td>{status_icon}</td>
-                <td>{h.display_name}</td>
+                <td>{display_name}</td>
                 <td><span class="badge {status_class}">{h.status.value}</span></td>
                 <td>{h.score:+d}</td>
-                <td class="value-cell">{h.value or '-'}</td>
+                <td class="value-cell">{value}</td>
                 <td>{remediation}</td>
             </tr>
             """)
@@ -218,32 +237,39 @@ class ReportGenerator:
             weak_count=result.summary.get('weak', 0),
             misconfigured_count=result.summary.get('misconfigured', 0),
             missing_count=result.summary.get('missing', 0),
-            header_rows="".join(header_rows),
+            header_rows=Markup("".join(header_rows)),
             total_score=result.total_score,
             max_score=result.max_score,
         )
     
     def _generate_csv(self, result: ScanResult) -> str:
-        """Generate CSV report"""
-        lines = []
-        
-        # Header
-        lines.append("Header,Status,Score,Weight,Value,Description,Remediation")
-        
+        """Generate spreadsheet-safe CSV report."""
+        output = io.StringIO(newline="")
+        writer = csv.writer(output, lineterminator="\n")
+        writer.writerow(["Header", "Status", "Score", "Weight", "Value", "Description", "Remediation"])
+
+        def safe_cell(value: Any) -> str:
+            text = "" if value is None else str(value)
+            # Spreadsheet applications may execute formulas even inside quoted
+            # CSV fields. Prefix formula-like values with an apostrophe.
+            if text.lstrip(" \t\r\n")[:1] in {"=", "+", "-", "@"}:
+                return "'" + text
+            return text
+
         for h in result.header_results:
-            value = (h.value or "").replace('"', '""')
-            description = h.description.replace('"', '""')
-            
             remediation = ""
             if h.status != HeaderStatus.PRESENT and h.remediation:
                 remediation = h.remediation.action
-            
-            lines.append(
-                f'"{h.display_name}","{h.status.value}",{h.score},{h.weight},'
-                f'"{value}","{description}","{remediation}"'
-            )
-        
-        return "\n".join(lines)
+            writer.writerow([
+                safe_cell(h.display_name),
+                h.status.value,
+                h.score,
+                h.weight,
+                safe_cell(h.value),
+                safe_cell(h.description),
+                safe_cell(remediation),
+            ])
+        return output.getvalue()
     
     def _generate_markdown(self, result: ScanResult) -> str:
         """Generate Markdown report"""
@@ -252,15 +278,18 @@ class ReportGenerator:
         lines.append("# 🛡️ Security Headers Scan Report")
         lines.append("")
         lines.append("## Scan Details")
-        lines.append(f"- **URL**: {result.url}")
-        lines.append(f"- **Scan ID**: {result.id}")
-        lines.append(f"- **Timestamp**: {result.timestamp}")
+        lines.append(f"- **URL**: {_escape_markdown(result.url)}")
+        lines.append(f"- **Scan ID**: {_escape_markdown(result.id)}")
+        lines.append(f"- **Timestamp**: {_escape_markdown(result.timestamp)}")
         lines.append(f"- **Duration**: {result.scan_duration_ms:.0f}ms")
         lines.append(f"- **HTTP Status**: {result.http_status_code or 'N/A'}")
         lines.append("")
         
         lines.append("## Overall Score")
-        lines.append(f"**{result.percentage_score}%** ({result.grade}) - {result.risk_level.upper()} Risk")
+        lines.append(
+            f"**{result.percentage_score}%** ({_escape_markdown(result.grade)}) - "
+            f"{_escape_markdown(result.risk_level.upper())} Risk"
+        )
         lines.append("")
         lines.append("| Metric | Value |")
         lines.append("|--------|-------|")
@@ -284,7 +313,10 @@ class ReportGenerator:
                 HeaderStatus.MISSING: "❌",
             }.get(h.status, "?")
             
-            lines.append(f"| {h.display_name} | {status_emoji} {h.status.value} | {h.score:+d} |")
+            lines.append(
+                f"| {_escape_markdown(h.display_name)} | {status_emoji} "
+                f"{_escape_markdown(h.status.value)} | {h.score:+d} |"
+            )
         
         lines.append("")
         
@@ -296,10 +328,10 @@ class ReportGenerator:
             
             for i, h in enumerate(issues, 1):
                 if h.remediation:
-                    lines.append(f"### {i}. {h.display_name}")
-                    lines.append(f"- **Status**: {h.status.value}")
-                    lines.append(f"- **Action**: {h.remediation.action}")
-                    lines.append(f"- **Example**: `{h.remediation.example}`")
+                    lines.append(f"### {i}. {_escape_markdown(h.display_name)}")
+                    lines.append(f"- **Status**: {_escape_markdown(h.status.value)}")
+                    lines.append(f"- **Action**: {_escape_markdown(h.remediation.action)}")
+                    lines.append(f"- **Example**: `{_escape_markdown(h.remediation.example)}`")
                     lines.append("")
         
         lines.append("---")

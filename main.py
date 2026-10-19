@@ -15,6 +15,7 @@ A comprehensive security audit tool that checks:
 import sys
 import os
 from pathlib import Path
+from typing import Optional
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -26,10 +27,12 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 from rich.panel import Panel
+from rich.markup import escape as escape_rich_markup
 from rich import box
 import json
 
 from src.scanner import SecurityHeaderScanner
+from src.analyzer import HeaderAnalyzer
 from src.ssl_analyzer import SSLAnalyzer
 from src.fingerprinter import TechnologyFingerprinter
 from src.subdomain_scanner import SubdomainScanner
@@ -37,19 +40,16 @@ from src.directory_scanner import DirectoryScanner
 from src.reporter import ReportGenerator
 from src.storage import get_storage
 from src.headers import HeaderStatus
+from src.config import load_config as _load_shared_config
+from src.utils import normalize_http_url
 
 
 console = Console()
 
 
 def load_config():
-    """Load configuration from config.yaml"""
-    import yaml
-    config_path = Path(__file__).parent / "config.yaml"
-    if config_path.exists():
-        with open(config_path, 'r') as f:
-            return yaml.safe_load(f)
-    return {}
+    """Load and validate the repository configuration."""
+    return _load_shared_config()
 
 
 @click.group()
@@ -82,12 +82,16 @@ def scan(url: str, verbose: bool, format: str, output: str):
     scanner = SecurityHeaderScanner(
         timeout=config.get("scanner", {}).get("timeout", 30),
         max_retries=config.get("scanner", {}).get("max_retries", 3),
-        rate_limit_delay=config.get("scanner", {}).get("rate_limit_delay", 1.0),
+        rate_limit_delay=config["scanner"]["rate_limit_delay"],
+        max_batch_size=config["scanner"]["max_batch_size"],
+        user_agent=config["scanner"]["user_agent"],
+        follow_redirects=config["scanner"]["follow_redirects"],
+        analyzer=HeaderAnalyzer(config["thresholds"]),
     )
     
     reporter = ReportGenerator()
     
-    console.print(f"\n🔍 Scanning headers: [bold cyan]{url}[/bold cyan]\n")
+    console.print(f"\n🔍 Scanning headers: {url}\n", markup=False)
     
     with Progress(
         SpinnerColumn(),
@@ -99,27 +103,24 @@ def scan(url: str, verbose: bool, format: str, output: str):
         progress.update(task, completed=True)
     
     if result.error:
-        console.print(f"\n🚨 Error: {result.error}\n", style="bold red")
+        console.print(f"\n🚨 Error: {result.error}\n", style="bold red", markup=False)
         sys.exit(1)
     
-    # Generate and display report
-    if format == "text":
-        report = reporter.generate(result, "text")
-        console.print(report)
-    elif format == "json":
-        report = reporter.generate(result, "json")
-        if output:
-            Path(output).write_text(report)
-            console.print(f"\n✅ Report saved to: {output}")
-        else:
-            console.print(report)
-    elif format == "html":
-        report = reporter.generate(result, "html")
-        if output:
-            Path(output).write_text(report)
-            console.print(f"\n✅ HTML report saved to: {output}")
-        else:
-            console.print(report)
+    # All documented report formats share the same output and file handling.
+    report = reporter.generate(result, format)
+    if verbose and format == "text":
+        details = [
+            "", "VERBOSE DETAILS", f"Final URL: {result.final_url or 'N/A'}",
+            f"HTTP status: {result.http_status_code or 'N/A'}",
+            f"Duration: {result.scan_duration_ms:.1f} ms", "Security response headers:",
+        ]
+        details.extend(f"  {name}: {value}" for name, value in sorted(result.headers_found.items()))
+        report += "\n" + "\n".join(details)
+    if output:
+        Path(output).write_text(report, encoding="utf-8")
+        console.print(f"\n✅ {format.upper()} report saved to: {output}", markup=False)
+    else:
+        console.print(report, markup=False)
 
 
 # ============================================================================
@@ -137,7 +138,7 @@ def ssl(host: str, port: int, format: str, output: str):
     
     Example: python main.py ssl example.com
     """
-    console.print(f"\n🔐 Analyzing SSL/TLS: [bold cyan]{host}:{port}[/bold cyan]\n")
+    console.print(f"\n🔐 Analyzing SSL/TLS: {host}:{port}\n", markup=False)
     
     with Progress(
         SpinnerColumn(),
@@ -155,9 +156,9 @@ def ssl(host: str, port: int, format: str, output: str):
         report = json.dumps(result.to_dict(), indent=2)
         if output:
             Path(output).write_text(report)
-            console.print(f"✅ Report saved to: {output}")
+            console.print(f"✅ Report saved to: {output}", markup=False)
         else:
-            console.print(report)
+            console.print(report, markup=False)
         return
     
     # Text output
@@ -171,9 +172,9 @@ def ssl(host: str, port: int, format: str, output: str):
     if result.certificate:
         cert = result.certificate
         console.print(f"\n📜 Certificate Information:")
-        console.print(f"   Subject: {cert.subject}")
-        console.print(f"   Issuer: {cert.issuer}")
-        console.print(f"   Valid Until: {cert.valid_until}")
+        console.print(f"   Subject: {cert.subject}", markup=False)
+        console.print(f"   Issuer: {cert.issuer}", markup=False)
+        console.print(f"   Valid Until: {cert.valid_until}", markup=False)
         
         if cert.is_expired:
             console.print(f"   ⚠️  [bold red]EXPIRED![/bold red] (Expired {abs(cert.days_remaining)} days ago)")
@@ -185,8 +186,8 @@ def ssl(host: str, port: int, format: str, output: str):
     if result.tls_analysis:
         tls = result.tls_analysis
         console.print(f"\n🔒 TLS Configuration:")
-        console.print(f"   TLS Version: {tls.tls_version}")
-        console.print(f"   Cipher Suite: {tls.cipher_suite}")
+        console.print(f"   TLS Version: {tls.tls_version}", markup=False)
+        console.print(f"   Cipher Suite: {tls.cipher_suite}", markup=False)
         
         if tls.is_secure:
             console.print(f"   ✅ Configuration is secure")
@@ -196,12 +197,12 @@ def ssl(host: str, port: int, format: str, output: str):
     if result.issues:
         console.print(f"\n🚨 Issues Found:")
         for issue in result.issues:
-            console.print(f"   • {issue}")
+            console.print(f"   • {issue}", markup=False)
     
     if result.recommendations:
         console.print(f"\n💡 Recommendations:")
         for rec in result.recommendations:
-            console.print(f"   • {rec}")
+            console.print(f"   • {rec}", markup=False)
 
 
 # ============================================================================
@@ -218,7 +219,7 @@ def fingerprint(url: str, format: str, output: str):
     
     Example: python main.py fingerprint https://example.com
     """
-    console.print(f"\n🔎 Fingerprinting: [bold cyan]{url}[/bold cyan]\n")
+    console.print(f"\n🔎 Fingerprinting: {url}\n", markup=False)
     
     with Progress(
         SpinnerColumn(),
@@ -236,24 +237,24 @@ def fingerprint(url: str, format: str, output: str):
         report = json.dumps(result.to_dict(), indent=2, default=str)
         if output:
             Path(output).write_text(report)
-            console.print(f"✅ Report saved to: {output}")
+            console.print(f"✅ Report saved to: {output}", markup=False)
         else:
-            console.print(report)
+            console.print(report, markup=False)
         return
     
     # Text output
     console.print(Panel.fit(
         f"[bold]Technology Fingerprint Results[/bold]\n\n"
-        f"URL: {result.url}\n"
+        f"URL: {escape_rich_markup(result.url)}\n"
         f"Technologies Found: {len(result.technologies)}\n"
         f"Security Score: [bold]{result.overall_score}/100[/bold]",
         border_style="green"
     ))
     
     if result.server:
-        console.print(f"\n🖥️  Server: {result.server}")
+        console.print(f"\n🖥️  Server: {result.server}", markup=False)
     if result.powered_by:
-        console.print(f"⚡ Powered By: {result.powered_by}")
+        console.print(f"⚡ Powered By: {result.powered_by}", markup=False)
     
     # Categorize technologies
     if result.frontend_frameworks:
@@ -267,7 +268,7 @@ def fingerprint(url: str, format: str, output: str):
             console.print(f"   • {bt}")
     
     if result.cms_platform:
-        console.print(f"\n📝 CMS Platform: [bold]{result.cms_platform}[/bold]")
+        console.print(f"\n📝 CMS Platform: {result.cms_platform}", markup=False)
     
     if result.javascript_libs:
         console.print(f"\n📚 JavaScript Libraries:")
@@ -277,12 +278,12 @@ def fingerprint(url: str, format: str, output: str):
     if result.issues:
         console.print(f"\n🚨 Security Issues:")
         for issue in result.issues:
-            console.print(f"   • {issue}")
+            console.print(f"   • {issue}", markup=False)
     
     if result.recommendations:
         console.print(f"\n💡 Recommendations:")
         for rec in result.recommendations:
-            console.print(f"   • {rec}")
+            console.print(f"   • {rec}", markup=False)
 
 
 # ============================================================================
@@ -300,7 +301,7 @@ def subdomains(domain: str, format: str, output: str, quick: bool):
     
     Example: python main.py subdomains example.com
     """
-    console.print(f"\n🌐 Scanning subdomains: [bold cyan]{domain}[/bold cyan]\n")
+    console.print(f"\n🌐 Scanning subdomains: {domain}\n", markup=False)
     
     with Progress(
         SpinnerColumn(),
@@ -310,7 +311,8 @@ def subdomains(domain: str, format: str, output: str, quick: bool):
         task = progress.add_task("Discovering subdomains...", total=None)
         
         scanner = SubdomainScanner(timeout=5, max_concurrent=50)
-        result = scanner.scan(domain)
+        wordlist = scanner.QUICK_SUBDOMAINS if quick else None
+        result = scanner.scan(domain, wordlist=wordlist)
         
         progress.update(task, completed=True)
     
@@ -318,9 +320,9 @@ def subdomains(domain: str, format: str, output: str, quick: bool):
         report = json.dumps(result.to_dict(), indent=2, default=str)
         if output:
             Path(output).write_text(report)
-            console.print(f"✅ Report saved to: {output}")
+            console.print(f"✅ Report saved to: {output}", markup=False)
         else:
-            console.print(report)
+            console.print(report, markup=False)
         return
     
     # Text output
@@ -351,12 +353,12 @@ def subdomains(domain: str, format: str, output: str, quick: bool):
     if result.issues:
         console.print(f"\n🚨 Security Issues:")
         for issue in result.issues:
-            console.print(f"   • {issue}")
+            console.print(f"   • {issue}", markup=False)
     
     if result.recommendations:
         console.print(f"\n💡 Recommendations:")
         for rec in result.recommendations:
-            console.print(f"   • {rec}")
+            console.print(f"   • {rec}", markup=False)
 
 
 # ============================================================================
@@ -374,7 +376,7 @@ def dirs(url: str, format: str, output: str, quick: bool):
     
     Example: python main.py dirs https://example.com
     """
-    console.print(f"\n📁 Scanning directories: [bold cyan]{url}[/bold cyan]\n")
+    console.print(f"\n📁 Scanning directories: {url}\n", markup=False)
     
     with Progress(
         SpinnerColumn(),
@@ -396,15 +398,15 @@ def dirs(url: str, format: str, output: str, quick: bool):
         report = json.dumps(result.to_dict(), indent=2, default=str)
         if output:
             Path(output).write_text(report)
-            console.print(f"✅ Report saved to: {output}")
+            console.print(f"✅ Report saved to: {output}", markup=False)
         else:
-            console.print(report)
+            console.print(report, markup=False)
         return
     
     # Text output
     console.print(Panel.fit(
         f"[bold]Directory Scan Results[/bold]\n\n"
-        f"URL: {result.base_url}\n"
+        f"URL: {escape_rich_markup(result.base_url)}\n"
         f"Paths Scanned: {result.scanned_paths}\n"
         f"Paths Found: {result.found_paths}\n"
         f"Security Score: [bold]{result.overall_score}/100[/bold]",
@@ -427,12 +429,34 @@ def dirs(url: str, format: str, output: str, quick: bool):
     if result.issues:
         console.print(f"\n🚨 Security Issues:")
         for issue in result.issues:
-            console.print(f"   • {issue}")
+            console.print(f"   • {issue}", markup=False)
     
     if result.recommendations:
         console.print(f"\n💡 Recommendations:")
         for rec in result.recommendations:
-            console.print(f"   • {rec}")
+            console.print(f"   • {rec}", markup=False)
+
+
+def _compute_audit_scores(results):
+    """Return visible component scores and a header/TLS-only composite."""
+    score_components = {}
+    headers_data = results.get("headers") or {}
+    header_score = (headers_data.get("score") or {}).get("percentage")
+    if not headers_data.get("error") and isinstance(header_score, (int, float)):
+        score_components["headers"] = float(header_score)
+
+    ssl_data = results.get("ssl") or {}
+    if ssl_data.get("is_reachable") and isinstance(ssl_data.get("overall_score"), (int, float)):
+        score_components["ssl"] = float(ssl_data["overall_score"])
+
+    for key in ("fingerprint", "subdomains", "directories"):
+        component = results.get(key) or {}
+        if not component.get("error") and isinstance(component.get("overall_score"), (int, float)):
+            score_components[key] = float(component["overall_score"])
+
+    composite = [score_components[key] for key in ("headers", "ssl") if key in score_components]
+    overall = round(sum(composite) / len(composite), 1) if composite else None
+    return score_components, overall
 
 
 # ============================================================================
@@ -449,20 +473,29 @@ def audit(url: str, format: str, output: str):
     
     Example: python main.py audit https://example.com
     """
+    config = load_config()
     console.print(Panel.fit(
         "[bold cyan]🛡️  SECURITY AUDIT PRO[/bold cyan]\n\n"
         "Running comprehensive security assessment...",
         border_style="bold blue"
     ))
     
-    # Parse domain
+    # Parse and validate the URL once; use hostname and port separately.
     from urllib.parse import urlparse
-    parsed = urlparse(url)
-    host = parsed.netloc or url.replace("https://", "").replace("http://", "").split("/")[0]
-    domain = host.replace("www.", "")
+    try:
+        audit_url = normalize_http_url(url)
+        parsed = urlparse(audit_url)
+        host = parsed.hostname
+        explicit_port = parsed.port
+    except ValueError as exc:
+        raise click.BadParameter(str(exc)) from exc
+    if not host:
+        raise click.BadParameter("Provide an HTTP(S) URL with a hostname")
+    domain = host[4:] if host.lower().startswith("www.") else host
+    tls_port = explicit_port if parsed.scheme.lower() == "https" and explicit_port else 443
     
     results = {
-        "url": url,
+        "url": audit_url,
         "domain": domain,
         "timestamp": str(datetime.now()),
         "headers": None,
@@ -477,8 +510,16 @@ def audit(url: str, format: str, output: str):
     # 1. Security Headers Scan
     console.print(f"\n[cyan]1. Scanning security headers...[/cyan]")
     try:
-        scanner = SecurityHeaderScanner()
-        header_result = scanner.scan(url)
+        scanner = SecurityHeaderScanner(
+            timeout=config["scanner"]["timeout"],
+            max_retries=config["scanner"]["max_retries"],
+            rate_limit_delay=config["scanner"]["rate_limit_delay"],
+            max_batch_size=config["scanner"]["max_batch_size"],
+            user_agent=config["scanner"]["user_agent"],
+            follow_redirects=config["scanner"]["follow_redirects"],
+            analyzer=HeaderAnalyzer(config["thresholds"]),
+        )
+        header_result = scanner.scan(audit_url)
         results["headers"] = header_result.to_dict()
         
         if header_result.percentage_score < 50:
@@ -494,7 +535,7 @@ def audit(url: str, format: str, output: str):
     console.print(f"[cyan]2. Analyzing SSL/TLS...[/cyan]")
     try:
         ssl_analyzer = SSLAnalyzer()
-        ssl_result = ssl_analyzer.analyze(domain)
+        ssl_result = ssl_analyzer.analyze(host, tls_port)
         results["ssl"] = ssl_result.to_dict()
         
         if ssl_result.overall_score < 70:
@@ -510,7 +551,7 @@ def audit(url: str, format: str, output: str):
     console.print(f"[cyan]3. Fingerprinting technologies...[/cyan]")
     try:
         fingerprinter = TechnologyFingerprinter()
-        fp_result = fingerprinter.fingerprint(url)
+        fp_result = fingerprinter.fingerprint(audit_url)
         results["fingerprint"] = fp_result.to_dict()
         
         for issue in fp_result.issues:
@@ -542,7 +583,7 @@ def audit(url: str, format: str, output: str):
     console.print(f"[cyan]5. Scanning directories...[/cyan]")
     try:
         dir_scanner = DirectoryScanner()
-        dir_result = dir_scanner.scan(url, check_directories=False)
+        dir_result = dir_scanner.scan(audit_url, check_directories=False)
         results["directories"] = dir_result.to_dict()
         
         for issue in dir_result.issues:
@@ -554,29 +595,24 @@ def audit(url: str, format: str, output: str):
     except Exception as e:
         results["directories"] = {"error": str(e)}
     
-    # Calculate overall score
-    scores = []
-    if results["headers"]:
-        scores.append(results["headers"].get("percentage_score", 0))
-    if results["ssl"]:
-        scores.append(results["ssl"].get("overall_score", 0))
-    if results["fingerprint"]:
-        scores.append(results["fingerprint"].get("overall_score", 100))
-    if results["subdomains"]:
-        scores.append(results["subdomains"].get("overall_score", 100))
-    if results["directories"]:
-        scores.append(results["directories"].get("overall_score", 100))
-    
-    results["overall_score"] = sum(scores) / len(scores) if scores else 0
+    # Keep component scores visible. Only combine the independently normalized
+    # header and TLS scores; the other scanners use different heuristics and
+    # should not silently distort the composite.
+    score_components, overall_score = _compute_audit_scores(results)
+    results["score_components"] = score_components
+    results["overall_score"] = overall_score
+    results["overall_score_note"] = (
+        "Average of successful header and TLS scores only; other component scores are heuristic and shown separately."
+    )
     
     # Output
     if format == "json":
         report = json.dumps(results, indent=2, default=str)
         if output:
             Path(output).write_text(report)
-            console.print(f"\n✅ Full audit saved to: {output}")
+            console.print(f"\n✅ Full audit saved to: {output}", markup=False)
         else:
-            console.print(report)
+            console.print(report, markup=False)
         return
     
     # Text output
@@ -584,11 +620,18 @@ def audit(url: str, format: str, output: str):
     console.print("📊 AUDIT SUMMARY")
     console.print("=" * 60)
     
-    console.print(f"\n🎯 Overall Security Score: [bold]{results['overall_score']:.1f}/100[/bold]")
+    if results["overall_score"] is None:
+        console.print("\n🎯 Overall Security Score: [bold]N/A[/bold] (header and TLS checks did not complete)")
+    else:
+        console.print(f"\n🎯 Header/TLS Score: [bold]{results['overall_score']:.1f}/100[/bold]")
     
     if results["headers"]:
         h = results["headers"]
-        console.print(f"\n🔐 Security Headers: {h.get('percentage_score', 0):.1f}%")
+        header_score = (h.get("score") or {}).get("percentage")
+        if isinstance(header_score, (int, float)):
+            console.print(f"\n🔐 Security Headers: {header_score:.1f}%")
+        else:
+            console.print("\n🔐 Security Headers: N/A")
     if results["ssl"]:
         s = results["ssl"]
         console.print(f"🔒 SSL/TLS: {s.get('grade', 'N/A')} ({s.get('overall_score', 0)}/100)")
@@ -605,7 +648,7 @@ def audit(url: str, format: str, output: str):
     if results["critical_findings"]:
         console.print(f"\n🚨 CRITICAL FINDINGS:")
         for finding in results["critical_findings"]:
-            console.print(f"   [{finding['severity'].upper()}] {finding['message']}")
+            console.print(f"   [{finding['severity'].upper()}] {finding['message']}", markup=False)
 
 
 # ============================================================================
@@ -634,14 +677,23 @@ def headers():
 
 
 @cli.command()
-@click.option("--host", "-h", default="0.0.0.0", help="Host to bind to")
-@click.option("--port", "-p", type=int, default=5000, help="Port to bind to")
-def serve(host: str, port: int):
-    """Start the REST API server."""
+@click.option("--host", "-h", default=None, help="Override api.host from config.yaml")
+@click.option("--port", "-p", type=click.IntRange(1, 65535), default=None, help="Override api.port from config.yaml")
+def serve(host: Optional[str], port: Optional[int]):
+    """Start the REST API server using validated configuration."""
     from src.api import create_app
-    console.print(f"\n🚀 Starting API server on {host}:{port}\n")
+    config = load_config()
+    api_config = config["api"]
+    bind_host = host or api_config["host"]
+    bind_port = port or api_config["port"]
+    console.print(f"\n🚀 Starting API server on {bind_host}:{bind_port}\n")
     app = create_app()
-    app.run(host=host, port=port, debug=False)
+    app.run(
+        host=bind_host,
+        port=bind_port,
+        debug=api_config["debug"],
+        threaded=api_config["threaded"],
+    )
 
 
 def main():
@@ -652,7 +704,7 @@ def main():
         console.print("\n\n👋 Goodbye!\n")
         sys.exit(0)
     except Exception as e:
-        console.print(f"\n🚨 Error: {e}\n", style="bold red")
+        console.print(f"\n🚨 Error: {e}\n", style="bold red", markup=False)
         sys.exit(1)
 
 

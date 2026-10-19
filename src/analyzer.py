@@ -5,6 +5,7 @@ Header Analyzer
 Analysis and scoring utilities for security headers.
 """
 
+import math
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
 
@@ -43,12 +44,11 @@ class HeaderAnalyzer:
         "F": 0,
     }
     
-    # Risk level thresholds
+    # Higher security scores mean lower operational risk.
     RISK_THRESHOLDS = {
-        "excellent": 90,
-        "good": 75,
+        "low": 75,
         "medium": 50,
-        "low": 25,
+        "high": 25,
         "critical": 0,
     }
     
@@ -66,8 +66,21 @@ class HeaderAnalyzer:
         "gdpr": ["strict-transport-security", "cache-control", "referrer-policy"],
     }
     
-    def __init__(self):
-        pass
+    def __init__(self, risk_thresholds: Optional[Dict[str, float]] = None):
+        thresholds = dict(self.RISK_THRESHOLDS if risk_thresholds is None else risk_thresholds)
+        levels = ("critical", "high", "medium", "low")
+        if not set(levels).issubset(thresholds):
+            raise ValueError("risk_thresholds must define critical, high, medium, and low")
+        values = [thresholds[level] for level in levels]
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0 <= value <= 100
+            for value in values
+        ) or values != sorted(values):
+            raise ValueError("risk thresholds must be ordered numbers between 0 and 100")
+        self.risk_thresholds = {level: thresholds[level] for level in levels}
     
     def calculate_percentage_score(self, total_score: int, max_score: int) -> float:
         """
@@ -83,11 +96,11 @@ class HeaderAnalyzer:
         if max_score == 0:
             return 0.0
         
-        # Normalize to 0-100 range, allowing negative values
+        # Contributions range from -weight (missing) to +weight (present).
+        # Map [-100, +100] to [0, 100], then clamp the final score.
         raw_percentage = (total_score / max_score) * 100
-        
-        # Clamp between 0 and 100
-        return max(0.0, min(100.0, raw_percentage + 100)) / 2
+        normalized = (raw_percentage + 100) / 2
+        return max(0.0, min(100.0, normalized))
     
     def get_grade(self, percentage_score: float) -> str:
         """
@@ -119,7 +132,7 @@ class HeaderAnalyzer:
             Risk level string
         """
         for level, threshold in sorted(
-            self.RISK_THRESHOLDS.items(),
+            self.risk_thresholds.items(),
             key=lambda x: x[1],
             reverse=True
         ):

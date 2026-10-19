@@ -5,11 +5,12 @@ Technology Fingerprinter Module
 Detects technologies, frameworks, CMS, and libraries used by a website.
 """
 
+import math
 import requests
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
-from bs4 import BeautifulSoup
+from .utils import normalize_http_url
 
 
 @dataclass
@@ -80,7 +81,7 @@ class TechnologyFingerprinter:
         "React": {
             "category": "JavaScript Framework",
             "patterns": [
-                (r"react\.js", "react\.min\.js", "react-dom"),
+                (r"react\.js", r"react\.min\.js", "react-dom"),
                 (r"_reactFiber", r"__REACT_DEVTOOLS_GLOBAL_HOOK__"),
             ],
             "files": ["react.production.min.js", "react.development.js"],
@@ -275,8 +276,13 @@ class TechnologyFingerprinter:
         },
     }
     
-    def __init__(self, timeout: int = 30):
-        self.timeout = timeout
+    def __init__(self, timeout: int = 30, max_response_bytes: int = 2 * 1024 * 1024):
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0.1 <= timeout <= 300:
+            raise ValueError("timeout must be between 0.1 and 300 seconds")
+        if isinstance(max_response_bytes, bool) or not isinstance(max_response_bytes, int) or not 1 <= max_response_bytes <= 50 * 1024 * 1024:
+            raise ValueError("max_response_bytes must be an integer between 1 and 52428800")
+        self.timeout = float(timeout)
+        self.max_response_bytes = max_response_bytes
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Security Header Scanner Bot)"
@@ -309,9 +315,22 @@ class TechnologyFingerprinter:
         )
         
         try:
-            response = self.session.get(url, timeout=self.timeout, verify=True)
-            html_content = response.text
-            headers = {k.lower(): v for k, v in response.headers.items()}
+            url = normalize_http_url(url)
+            result.url = url
+
+            body = bytearray()
+            with self.session.get(url, timeout=self.timeout, verify=True, stream=True) as response:
+                for chunk in response.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    remaining = self.max_response_bytes - len(body)
+                    body.extend(chunk[:remaining])
+                    if len(body) >= self.max_response_bytes:
+                        break
+                encoding = response.encoding or "utf-8"
+                headers = {k.lower(): v for k, v in response.headers.items()}
+                cookies = response.cookies
+            html_content = bytes(body).decode(encoding, errors="replace")
             
             # Extract server info
             result.server = headers.get("server")
@@ -319,7 +338,7 @@ class TechnologyFingerprinter:
             result.x_powered_by = headers.get("x-aspnet-version")
             
             # Analyze HTML content
-            technologies = self._analyze_content(html_content, headers, response.cookies)
+            technologies = self._analyze_content(html_content, headers, cookies)
             result.technologies = technologies
             
             # Categorize technologies
@@ -356,11 +375,12 @@ class TechnologyFingerprinter:
             # Check headers
             if "headers" in tech_info:
                 for header_name in tech_info["headers"]:
-                    header_value = headers.get(header_name, "")
+                    header_value = headers.get(header_name.lower(), "")
                     if header_value:
+                        header_evidence = f"{header_name}: {header_value}"
                         for pattern in tech_info["patterns"]:
                             for p in pattern:
-                                if re.search(p, header_value, re.IGNORECASE):
+                                if re.search(p, header_evidence, re.IGNORECASE):
                                     detected.append(Technology(
                                         name=tech_name,
                                         category=tech_info["category"],
@@ -384,14 +404,11 @@ class TechnologyFingerprinter:
             for pattern_group in tech_info["patterns"]:
                 for pattern in pattern_group:
                     if re.search(pattern, html, re.IGNORECASE):
-                        # Extract version if possible
-                        version_match = re.search(r'(\d+\.[\d\.]+)', html)
-                        version = version_match.group(1) if version_match else None
-                        
+                        # Version is set only by technology-specific evidence below.
                         detected.append(Technology(
                             name=tech_name,
                             category=tech_info["category"],
-                            version=version,
+                            version=None,
                             confidence="high",
                             evidence=f"Found pattern in HTML"
                         ))
@@ -399,9 +416,10 @@ class TechnologyFingerprinter:
         
         # Check for common version disclosure patterns
         version_patterns = {
-            "jQuery": r'jquery.*?(\d+\.\d+\.\d+)',
+            "jQuery": r'jquery[^\d]{0,40}(\d+\.\d+\.\d+)',
             "PHP": r'X-Powered-By.*?PHP[/\s]*(\d+\.\d+\.\d+)',
             "Python": r'X-Powered-By.*?Python[/\s]*(\d+\.\d+)',
+            "React": r'react(?:-dom)?(?:@|[-/])v?(\d+\.\d+(?:\.\d+)?)',
             "WordPress": r'wp-includes.*?ver=(\d+\.\d+\.\d+)',
         }
         
@@ -421,33 +439,39 @@ class TechnologyFingerprinter:
                         evidence=f"Version found: {match.group(1)}"
                     ))
         
-        return detected
+        unique = {}
+        for tech in detected:
+            existing = unique.get(tech.name)
+            if existing is None:
+                unique[tech.name] = tech
+            elif existing.version is None and tech.version is not None:
+                existing.version = tech.version
+        return list(unique.values())
     
     def _analyze_security_findings(self, technologies: List[Technology], headers: Dict) -> tuple:
         """Analyze technologies for security issues"""
         issues = []
         recommendations = []
         
-        tech_names = [t.name.lower() for t in technologies]
-        
-        # Check for outdated technologies
+        # Compare each detected version against its own declared minimum.
         outdated_tech = {
-            "jquery": ("jQuery < 3.0", "Upgrade jQuery to latest version"),
-            "php": ("PHP < 8.0", "Upgrade PHP to latest version"),
-            "react": ("React < 18.0", "Upgrade React to latest version"),
+            "jquery": ((3, 0, 0), "jQuery < 3.0", "Upgrade jQuery to a supported version"),
+            "php": ((8, 0, 0), "PHP < 8.0", "Upgrade PHP to a supported version"),
+            "react": ((18, 0, 0), "React < 18.0", "Upgrade React to a supported version"),
         }
-        
-        for tech, (issue, rec) in outdated_tech.items():
-            if tech in tech_names:
-                tech_obj = next((t for t in technologies if t.name.lower() == tech), None)
-                if tech_obj and tech_obj.version:
-                    try:
-                        major = int(tech_obj.version.split('.')[0])
-                        if major < 3:
-                            issues.append(f"{tech_obj.name} {tech_obj.version} may be outdated")
-                            recommendations.append(rec)
-                    except:
-                        pass
+        for tech in technologies:
+            policy = outdated_tech.get(tech.name.lower())
+            if not policy or not tech.version:
+                continue
+            minimum, label, recommendation = policy
+            match = re.match(r"^\s*v?(\d+(?:\.\d+)*)", tech.version, re.IGNORECASE)
+            if not match:
+                continue
+            version = tuple(int(part) for part in match.group(1).split("."))
+            version = (version + (0, 0, 0))[:3]
+            if version < minimum:
+                issues.append(f"{tech.name} {tech.version} is outdated and below the supported minimum ({label})")
+                recommendations.append(recommendation)
         
         # Check for technology disclosure
         if headers.get("x-powered-by"):
@@ -461,11 +485,6 @@ class TechnologyFingerprinter:
                 if re.search(r'/\d+\.\d+', server):
                     issues.append(f"Server version disclosed: {server}")
                     recommendations.append("Hide server version in production")
-        
-        # Check for common vulnerable patterns
-        if "jquery" in tech_names:
-            issues.append("jQuery detected - ensure no known vulnerable versions")
-            recommendations.append("Keep jQuery updated to prevent XSS vulnerabilities")
         
         return issues, recommendations
     
