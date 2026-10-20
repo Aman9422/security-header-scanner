@@ -13,10 +13,10 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 from jinja2 import Template
-from markupsafe import Markup
 
 from .scanner import ScanResult, HeaderResult
 from .headers import HeaderStatus
+from .utils import redact_sensitive_url
 
 
 def _escape_markdown(value: Any) -> str:
@@ -84,7 +84,7 @@ class ReportGenerator:
         lines.append("=" * 70)
         lines.append("              🛡️  SECURITY HEADERS SCANNER PRO")
         lines.append("=" * 70)
-        lines.append(f"  Target: {result.url}")
+        lines.append(f"  Target: {redact_sensitive_url(result.url)}")
         lines.append(f"  Scan ID: {result.id}")
         lines.append(f"  Time: {result.timestamp}")
         lines.append(f"  Duration: {result.scan_duration_ms:.0f}ms")
@@ -137,6 +137,18 @@ class ReportGenerator:
             # Show remediation if not present
             if header.status != HeaderStatus.PRESENT and header.remediation:
                 lines.append(f"      📌 {header.remediation.action}")
+
+        if result.cookie_results:
+            lines.extend(["", "=" * 70, "  COOKIE SECURITY ATTRIBUTES", "=" * 70])
+            for cookie in result.cookie_results:
+                same_site = cookie.same_site or "Missing"
+                status = "OK" if not cookie.issues else "ISSUES"
+                lines.append(
+                    f"  {cookie.name}: Secure={'Yes' if cookie.secure else 'No'}, "
+                    f"HttpOnly={'Yes' if cookie.http_only else 'No'}, SameSite={same_site} [{status}]"
+                )
+                for issue in cookie.issues:
+                    lines.append(f"      ⚠ {issue}")
         
         lines.append("")
         
@@ -176,11 +188,10 @@ class ReportGenerator:
     
     def _generate_html(self, result: ScanResult) -> str:
         """Generate HTML report"""
-        # Autoescape all normal template values. The prebuilt rows below are
-        # marked safe only after every untrusted field has been HTML-escaped.
+        # Pass structured values into an autoescaped template; untrusted data is
+        # never marked as safe HTML.
         template = Template(self.html_template, autoescape=True)
-        
-        # Prepare header rows
+
         header_rows = []
         for h in result.header_results:
             status_class = h.status.value
@@ -190,29 +201,30 @@ class ReportGenerator:
                 HeaderStatus.MISCONFIGURED: "✗",
                 HeaderStatus.MISSING: "✗",
             }.get(h.status, "?")
-            
-            remediation = ""
+            remediation_action = ""
+            remediation_example = ""
             if h.status != HeaderStatus.PRESENT and h.remediation:
-                action = html.escape(str(h.remediation.action), quote=True)
-                example = html.escape(str(h.remediation.example), quote=True)
-                remediation = f"""
-                <div class="remediation">
-                    <strong>Remediation:</strong> {action}<br>
-                    <code>{example}</code>
-                </div>
-                """
-            display_name = html.escape(str(h.display_name), quote=True)
-            value = html.escape(str(h.value), quote=True) if h.value is not None else "-"
-            header_rows.append(f"""
-            <tr class="{status_class}">
-                <td>{status_icon}</td>
-                <td>{display_name}</td>
-                <td><span class="badge {status_class}">{h.status.value}</span></td>
-                <td>{h.score:+d}</td>
-                <td class="value-cell">{value}</td>
-                <td>{remediation}</td>
-            </tr>
-            """)
+                remediation_action = h.remediation.action
+                remediation_example = h.remediation.example
+            header_rows.append({
+                "status_class": status_class,
+                "status_icon": status_icon,
+                "display_name": h.display_name,
+                "status": h.status.value,
+                "score": f"{h.score:+d}",
+                "value": h.value if h.value is not None else "-",
+                "remediation_action": remediation_action,
+                "remediation_example": remediation_example,
+            })
+
+        cookie_rows = [{
+            "status_class": "present" if not cookie.issues else "misconfigured",
+            "name": cookie.name,
+            "secure": "Yes" if cookie.secure else "No",
+            "http_only": "Yes" if cookie.http_only else "No",
+            "same_site": cookie.same_site or "Missing",
+            "issues": "; ".join(cookie.issues) if cookie.issues else "No issues",
+        } for cookie in result.cookie_results]
         
         # Get color based on grade
         grade_colors = {
@@ -224,7 +236,7 @@ class ReportGenerator:
         score_color = grade_colors.get(result.grade, "#6c757d")
         
         return template.render(
-            url=result.url,
+            url=redact_sensitive_url(result.url),
             scan_id=result.id,
             timestamp=result.timestamp,
             duration_ms=round(result.scan_duration_ms, 0),
@@ -237,7 +249,9 @@ class ReportGenerator:
             weak_count=result.summary.get('weak', 0),
             misconfigured_count=result.summary.get('misconfigured', 0),
             missing_count=result.summary.get('missing', 0),
-            header_rows=Markup("".join(header_rows)),
+            header_rows=header_rows,
+            cookie_count=len(result.cookie_results),
+            cookie_rows=cookie_rows,
             total_score=result.total_score,
             max_score=result.max_score,
         )
@@ -269,6 +283,21 @@ class ReportGenerator:
                 safe_cell(h.description),
                 safe_cell(remediation),
             ])
+        for cookie in result.cookie_results:
+            attributes = (
+                f"Secure={'Yes' if cookie.secure else 'No'}; "
+                f"HttpOnly={'Yes' if cookie.http_only else 'No'}; "
+                f"SameSite={cookie.same_site or 'Missing'}"
+            )
+            writer.writerow([
+                safe_cell(f"Cookie: {cookie.name}"),
+                "ISSUES" if cookie.issues else "OK",
+                "",
+                "",
+                safe_cell(attributes),
+                safe_cell("; ".join(cookie.issues)),
+                safe_cell("Set the recommended cookie security attributes"),
+            ])
         return output.getvalue()
     
     def _generate_markdown(self, result: ScanResult) -> str:
@@ -278,7 +307,7 @@ class ReportGenerator:
         lines.append("# 🛡️ Security Headers Scan Report")
         lines.append("")
         lines.append("## Scan Details")
-        lines.append(f"- **URL**: {_escape_markdown(result.url)}")
+        lines.append(f"- **URL**: {_escape_markdown(redact_sensitive_url(result.url))}")
         lines.append(f"- **Scan ID**: {_escape_markdown(result.id)}")
         lines.append(f"- **Timestamp**: {_escape_markdown(result.timestamp)}")
         lines.append(f"- **Duration**: {result.scan_duration_ms:.0f}ms")
@@ -320,6 +349,21 @@ class ReportGenerator:
         
         lines.append("")
         
+        if result.cookie_results:
+            lines.append("## Cookie Security Attributes")
+            lines.append("")
+            lines.append("| Cookie | Secure | HttpOnly | SameSite | Findings |")
+            lines.append("|--------|--------|----------|----------|----------|")
+            for cookie in result.cookie_results:
+                findings = "; ".join(cookie.issues) if cookie.issues else "No issues"
+                lines.append(
+                    f"| {_escape_markdown(cookie.name)} | {'Yes' if cookie.secure else 'No'} "
+                    f"| {'Yes' if cookie.http_only else 'No'} "
+                    f"| {_escape_markdown(cookie.same_site or 'Missing')} "
+                    f"| {_escape_markdown(findings)} |"
+                )
+            lines.append("")
+
         # Issues section
         issues = [h for h in result.header_results if h.status != HeaderStatus.PRESENT]
         if issues:
@@ -436,10 +480,43 @@ class ReportGenerator:
                     </tr>
                 </thead>
                 <tbody>
-                    {{ header_rows }}
+                    {% for row in header_rows %}
+                    <tr class="{{ row.status_class }}">
+                        <td>{{ row.status_icon }}</td>
+                        <td>{{ row.display_name }}</td>
+                        <td><span class="badge {{ row.status_class }}">{{ row.status }}</span></td>
+                        <td>{{ row.score }}</td>
+                        <td class="value-cell">{{ row.value }}</td>
+                        <td>
+                            {% if row.remediation_action %}
+                            <div class="remediation">
+                                <strong>Remediation:</strong> {{ row.remediation_action }}<br>
+                                <code>{{ row.remediation_example }}</code>
+                            </div>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
                 </tbody>
             </table>
         </div>
+
+        {% if cookie_count %}
+        <div class="score-card">
+            <h2 style="margin-bottom: 20px;">Cookie Security Attributes</h2>
+            <table>
+                <thead><tr><th>Cookie</th><th>Secure</th><th>HttpOnly</th><th>SameSite</th><th>Findings</th></tr></thead>
+                <tbody>
+                    {% for row in cookie_rows %}
+                    <tr class="{{ row.status_class }}">
+                        <td>{{ row.name }}</td><td>{{ row.secure }}</td><td>{{ row.http_only }}</td>
+                        <td>{{ row.same_site }}</td><td>{{ row.issues }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
         
         <div class="footer">
             Generated by Security Headers Scanner Pro
@@ -485,7 +562,8 @@ class BatchReportGenerator:
         lines.append("-" * 70)
         
         for r in results:
-            url_short = r.url[:42] + "..." if len(r.url) > 45 else r.url
+            display_url = redact_sensitive_url(r.url)
+            url_short = display_url[:42] + "..." if len(display_url) > 45 else display_url
             lines.append(f"  {url_short:<45} {r.percentage_score:>7.1f}% {r.grade:>6} {r.risk_level:>12}")
         
         lines.append("-" * 70)

@@ -78,9 +78,22 @@ api:
   host: "127.0.0.1"
   port: 5000
   debug: false
-  threaded: true
+  # Waitress worker threads; Flask's development server is not used.
+  threads: 8
+  # Set only behind exactly this many trusted reverse proxies; 0 ignores
+  # X-Forwarded-For and leaves request.remote_addr untouched.
+  trusted_proxy_hops: 0
+  # Use redis plus SECURITY_SCANNER_REDIS_URL to share limits across workers.
+  rate_limit_backend: memory
   cors_origins: []
   allow_private_networks: false
+  # Empty host/CIDR lists allow any globally-routable destination; set one or
+  # both to scope a shared API deployment. Host patterns accept exact names
+  # and *.example.com (subdomains only).
+  allowed_hosts: []
+  allowed_cidrs: []
+  # Non-standard ports are denied unless explicitly listed here.
+  allowed_ports: [80, 443]
   max_request_bytes: 1048576
   max_urls_per_minute: 30
 

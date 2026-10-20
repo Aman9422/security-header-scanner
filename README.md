@@ -2,7 +2,7 @@
 
 ### Scan, Analyze & Improve Your Website's Security Headers
 
-[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)]()
 [![Code Quality](https://img.shields.io/badge/Quality-A%2B-brightgreen.svg)]()
@@ -68,7 +68,7 @@ HTTP security headers are critical directives sent by servers to web browsers th
 **Time needed: 5 minutes**
 
 ### Step 1: Install Python
-Make sure you have Python 3.8 or higher:
+Make sure you have Python 3.10 or higher:
 
 ```bash
 # Check your Python version
@@ -100,8 +100,10 @@ venv\Scripts\activate
 source venv/bin/activate
 
 # Install required packages
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.lock
 ```
+
+`requirements.lock` pins the full dependency graph and package hashes for reproducible installs on Python 3.10+. `requirements.txt` contains the upgradeable version ranges used to regenerate the lock.
 
 ### Step 4: Execute Initial Scan
 
@@ -146,7 +148,7 @@ Example output:
 cd security-header-scanner
 python -m venv venv
 venv\Scripts\activate
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.lock
 
 # 3. Run the scanner:
 python main.py scan https://example.com
@@ -165,7 +167,7 @@ cd security-header-scanner
 # 3. Install dependencies:
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.lock
 
 # 4. Run:
 python main.py scan https://example.com
@@ -246,7 +248,13 @@ export SECURITY_SCANNER_ADMIN_TOKEN="$(python -c 'import secrets; print(secrets.
 python main.py serve
 ```
 
-The server binds to `127.0.0.1:5000` by default. Keep it behind a trusted reverse proxy if you bind it to a network interface. The health check is public; other endpoints require a bearer token. Scanner tokens can scan and read, reader tokens can read history/reports, and admin tokens can also clean up stored scans. `max_urls_per_minute` is enforced per `request.remote_addr` within one process (which may be the reverse proxy's address); configure trusted proxy address handling and a shared gateway limiter for multi-process deployments. API scans resolve and validate destinations again immediately before connecting, pin each socket connection to those validated IP addresses while preserving the requested Host header and TLS hostname verification, ignore ambient proxy variables, and do not follow redirects. Enforce outbound network egress rules as defense in depth.
+The API runs on Waitress, not Flask's development server, and binds to `127.0.0.1:5000` by default. Keep it behind a trusted reverse proxy if you bind it to a network interface. The health check is public; other endpoints require a bearer token. Scanner tokens can scan and read, reader tokens can read history/reports, and admin tokens can also clean up stored scans.
+
+`trusted_proxy_hops` defaults to `0`, so `X-Forwarded-For` is ignored. Set it only to the exact number of trusted reverse proxies that sanitize forwarded headers. The in-memory `max_urls_per_minute` limiter is for a single process; for multi-worker deployments, set `api.rate_limit_backend: redis` and provide `SECURITY_SCANNER_REDIS_URL`. Startup checks Redis and fails closed when the shared backend is unavailable.
+
+API targets default to TCP ports `80` and `443`. Use `allowed_hosts` for exact hostnames or `*.example.com` subdomain patterns and/or `allowed_cidrs` for resolved IP networks. When both allowlists are configured, both must match; every resolved address is checked. Empty host and CIDR lists allow any globally routable target. Private, loopback, link-local, and reserved addresses remain blocked unless `allow_private_networks: true` is explicitly set, even when a CIDR matches. Nonstandard ports must be added to `allowed_ports`; redirects and DNS rebinding remain blocked.
+
+API scans resolve destinations again immediately before connecting, pin each socket to validated IP addresses while preserving the Host header and TLS hostname verification, ignore ambient proxy variables, and do not follow redirects. Sensitive query values (such as tokens, keys, passwords, and secrets) are redacted in responses, reports, errors, and stored records; the unredacted URL is still used for scanning, and history lookup uses an opaque URL key. Cookie findings report `Secure`, `HttpOnly`, and `SameSite` attributes only—the cookie values are never persisted. Enforce outbound network egress rules as defense in depth.
 
 **API Endpoints:**
 
@@ -494,7 +502,14 @@ pytest tests/test_scanner.py::TestHeaderValidation -v
 pytest tests/ -v --durations=10
 ```
 
-**Test Status:** Run `pytest tests/` to execute the complete regression suite.
+**Test Status:** Run `pytest tests/` to execute the complete regression suite. CI runs the suite against Python 3.10–3.12, installs the hash-pinned lock, gates on Bandit medium-or-higher findings, and audits locked dependencies with `pip-audit`.
+
+To refresh the lock after editing `requirements.txt`, install the pinned lock-maintenance tool and compile hashes:
+
+```bash
+python -m pip install pip-tools==7.6.2
+pip-compile --resolver=backtracking --generate-hashes --output-file requirements.lock requirements.txt
+```
 
 ### Configuration
 
@@ -509,8 +524,14 @@ scanner:
 api:
   host: "127.0.0.1" # Local-only by default; expose only behind a protected proxy
   port: 5000
+  threads: 8
+  trusted_proxy_hops: 0 # Trust X-Forwarded-For only from this many known proxies
+  rate_limit_backend: memory # Set to redis for multi-worker deployments
   cors_origins: []
   allow_private_networks: false
+  allowed_hosts: [] # Exact hostnames or *.example.com patterns
+  allowed_cidrs: [] # Optional IPv4/IPv6 destination networks
+  allowed_ports: [80, 443]
   max_request_bytes: 1048576
   max_urls_per_minute: 30
 

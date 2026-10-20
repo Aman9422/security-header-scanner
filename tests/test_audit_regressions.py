@@ -7,8 +7,10 @@ from concurrent.futures import ThreadPoolExecutor
 import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import io
+import json
 import os
 import socket
+import sqlite3
 import stat
 import ssl
 import threading
@@ -29,7 +31,7 @@ from src.cvss_scoring import CVSSCalculator
 from src.directory_scanner import DirectoryScanner
 from src.ssl_analyzer import SSLAnalyzer
 from src.storage import JSONStorage, SQLiteStorage, get_storage
-from src.utils import generate_id, normalize_http_url
+from src.utils import generate_id, normalize_http_url, redact_sensitive_url
 from src.subdomain_scanner import SubdomainScanner
 from src.fingerprinter import Technology, TechnologyFingerprinter
 from src.headers import DEFAULT_HEADER_REGISTRY, HeaderStatus
@@ -100,6 +102,22 @@ def test_markdown_report_escapes_remote_url_html_and_markdown_syntax():
     assert "<script>" not in report
     assert "&lt;script&gt;" in report
     assert r"\[click\]" in report
+
+
+def test_sensitive_url_values_are_redacted_in_reports_and_serialization():
+    secret_url = "https://example.com/scan?api_key=top-secret-value&view=full&accessToken=other-secret"
+    safe_url = redact_sensitive_url(secret_url)
+    result = _scan_result(None, secret_url)
+    assert result.url == secret_url  # The actual target stays intact for scanning.
+    assert result.to_dict()["url"] == safe_url
+
+    reporter = ReportGenerator()
+    for format_type in ("json", "text", "html", "markdown", "csv"):
+        report = reporter.generate(result, format_type)
+        assert "top-secret-value" not in report
+        assert "other-secret" not in report
+        if format_type == "json":
+            assert json.loads(report)["url"] == safe_url
 
 
 def test_csv_report_neutralizes_spreadsheet_formulas():
@@ -189,6 +207,55 @@ def test_scan_result_does_not_persist_unrelated_response_headers(monkeypatch):
     }
     assert "set-cookie" not in result.headers_found
     assert "server" not in result.headers_found
+    assert result.cookie_results[0].name == "session"
+    assert "secret" not in json.dumps(result.to_dict())
+
+
+def test_cookie_security_analysis_checks_secure_httponly_and_samesite_without_values():
+    scanner = SecurityHeaderScanner(rate_limit_delay=0)
+    cookies = scanner._analyze_cookies(
+        [
+            "sid=highly-sensitive-cookie; Secure; HttpOnly; SameSite=Lax; Path=/",
+            "legacy=private-cookie; SameSite=None",
+        ]
+    )
+    assert len(cookies) == 2
+    assert cookies[0].name == "sid"
+    assert cookies[0].secure is True
+    assert cookies[0].http_only is True
+    assert cookies[0].same_site == "Lax"
+    assert cookies[0].issues == []
+    assert cookies[1].issues == [
+        "Missing Secure attribute", "Missing HttpOnly attribute", "SameSite=None requires Secure"
+    ]
+    serialized = json.dumps([cookie.to_dict() for cookie in cookies])
+    assert "highly-sensitive-cookie" not in serialized
+    assert "private-cookie" not in serialized
+
+    http_cookie = scanner._analyze_cookies(["anon=x"])[0]
+    assert "Missing Secure attribute" in http_cookie.issues
+    assert "Missing HttpOnly attribute" in http_cookie.issues
+    assert "Missing SameSite attribute" in http_cookie.issues
+
+
+def test_cookie_findings_appear_in_all_report_formats_without_values():
+    from src.scanner import CookieResult
+
+    result = dataclasses.replace(
+        _scan_result(None),
+        cookie_results=[CookieResult(
+            name="session-id",
+            secure=False,
+            http_only=False,
+            same_site=None,
+            issues=["Missing Secure attribute", "Missing HttpOnly attribute", "Missing SameSite attribute"],
+        )],
+    )
+    for format_type in ("json", "text", "html", "markdown", "csv"):
+        report = ReportGenerator().generate(result, format_type)
+        assert "session-id" in report
+        assert "Missing HttpOnly attribute" in report
+        assert "never-persist-this" not in report
 
 
 def test_api_scanner_pins_socket_destination_and_preserves_host_header():
@@ -236,6 +303,13 @@ def test_api_scanner_pins_socket_destination_and_preserves_host_header():
     assert resolved == [("dns-rebinding.invalid", port)]
     assert observed_hosts == [f"dns-rebinding.invalid:{port}"]
     assert result.headers_found == {"x_frame_options": "DENY"}
+    assert len(result.cookie_results) == 1
+    cookie = result.cookie_results[0]
+    assert cookie.name == "session"
+    assert cookie.issues == [
+        "Missing Secure attribute", "Missing HttpOnly attribute", "Missing SameSite attribute"
+    ]
+    assert "must-not-be-stored" not in json.dumps(result.to_dict())
 
 
 def test_pinned_https_adapter_verifies_the_original_hostname(tmp_path):
@@ -641,6 +715,94 @@ def test_storage_files_are_private_on_posix(tmp_path):
     assert stat.S_IMODE(sqlite_path.stat().st_mode) == 0o600
 
 
+@pytest.mark.parametrize("storage_kind", ["json", "sqlite"])
+def test_storage_redacts_urls_and_preserves_history_lookup(tmp_path, storage_kind):
+    secret_url = "https://example.com/path?token=very-secret-value&mode=full"
+    result = dataclasses.replace(
+        _scan_result(None, secret_url),
+        id="secret-scan-01",
+        error=f"request failed for {secret_url}",
+    )
+    if storage_kind == "json":
+        store = JSONStorage(tmp_path / "redacted-json", max_history=None, auto_cleanup_days=None)
+    else:
+        store = SQLiteStorage(tmp_path / "redacted-sqlite.db", max_history=None, auto_cleanup_days=None)
+
+    assert store.save(result)
+    assert len(store.get_by_url(secret_url.upper())) == 1
+    loaded = store.get(result.id)
+    assert loaded is not None
+    assert loaded.url == redact_sensitive_url(secret_url)
+    assert "very-secret-value" not in json.dumps(loaded.to_dict())
+
+    persisted = b"".join(path.read_bytes() for path in tmp_path.rglob("*") if path.is_file())
+    assert b"very-secret-value" not in persisted
+    assert b"token=very-secret-value" not in persisted
+
+
+def test_storage_migrates_legacy_persisted_secret_urls(tmp_path):
+    secret_url = "https://example.com/path?token=legacy-secret-value"
+    result = dataclasses.replace(
+        _scan_result(None, secret_url),
+        id="legacy-secret-01",
+        error=f"legacy failure: {secret_url}",
+    )
+    legacy_data = result.to_dict()
+    legacy_data["url"] = secret_url
+    legacy_data["final_url"] = secret_url
+    legacy_data["error"] = result.error
+
+    json_path = tmp_path / "legacy-json"
+    json_path.mkdir()
+    (json_path / f"{result.id}.json").write_text(json.dumps(legacy_data), encoding="utf-8")
+    (json_path / "index.json").write_text(json.dumps({result.id: {
+        "url": secret_url,
+        "timestamp": result.timestamp,
+        "percentage_score": result.percentage_score,
+        "grade": result.grade,
+        "file": f"{result.id}.json",
+        "saved_at_ns": 1,
+    }}), encoding="utf-8")
+    json_store = JSONStorage(json_path, max_history=None, auto_cleanup_days=None)
+    assert "legacy-secret-value" not in (json_path / "index.json").read_text(encoding="utf-8")
+    assert len(json_store.get_by_url(secret_url)) == 1
+    assert "legacy-secret-value" not in (json_path / f"{result.id}.json").read_text(encoding="utf-8")
+
+    sqlite_path = tmp_path / "legacy.sqlite3"
+    connection = sqlite3.connect(str(sqlite_path))
+    connection.execute("""
+        CREATE TABLE scans (
+            id TEXT PRIMARY KEY, url TEXT NOT NULL, timestamp TEXT NOT NULL,
+            scan_duration_ms REAL, http_status_code INTEGER, final_url TEXT,
+            headers_found TEXT, total_score INTEGER, max_score INTEGER,
+            percentage_score REAL, grade TEXT, risk_level TEXT, summary TEXT,
+            error TEXT, scan_data TEXT
+        )
+    """)
+    connection.execute("""
+        INSERT INTO scans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        result.id, secret_url, result.timestamp, result.scan_duration_ms,
+        result.http_status_code, secret_url, json.dumps(result.headers_found),
+        result.total_score, result.max_score, result.percentage_score, result.grade,
+        result.risk_level, json.dumps(result.summary), result.error, json.dumps(legacy_data),
+    ))
+    connection.commit()
+    connection.close()
+
+    sqlite_store = SQLiteStorage(sqlite_path, max_history=None, auto_cleanup_days=None)
+    assert len(sqlite_store.get_by_url(secret_url)) == 1
+    assert b"legacy-secret-value" not in sqlite_path.read_bytes()
+    row = sqlite3.connect(str(sqlite_path)).execute(
+        "SELECT url, final_url, error, scan_data, url_lookup_key FROM scans WHERE id = ?",
+        (result.id,),
+    ).fetchone()
+    assert row[0] == redact_sensitive_url(secret_url)
+    assert row[1] == redact_sensitive_url(secret_url)
+    assert "legacy-secret-value" not in (row[2] or "") + row[3]
+    assert row[4]
+
+
 def test_storage_retention_tie_breaks_choose_latest_insertions(tmp_path):
     timestamp = "2026-01-01 00:00:00"
     for storage_class, path in (
@@ -709,6 +871,12 @@ def test_http_url_normalizer_canonicalizes_scheme_host_and_fragment():
         "api:\n  cors_origins: ['*']\n",
         "storage:\n  type: unknown\n",
         "api:\n  max_request_bytes: false\n",
+        "api:\n  allowed_hosts: ['https://example.com']\n",
+        "api:\n  allowed_cidrs: ['192.0.2.1/99']\n",
+        "api:\n  allowed_ports: [0]\n",
+        "api:\n  trusted_proxy_hops: -1\n",
+        "api:\n  rate_limit_backend: external\n",
+        "api:\n  debug: true\n",
     ],
 )
 def test_config_loader_rejects_invalid_boundaries(tmp_path, yaml_content):
@@ -815,6 +983,99 @@ def test_api_target_validation_resolves_and_allows_public_targets(monkeypatch):
     assert validate_scan_target("https://example.com/") == "https://example.com/"
 
 
+def test_api_target_policy_enforces_host_cidr_and_port_allowlists(monkeypatch):
+    monkeypatch.setattr(
+        "src.api.socket.getaddrinfo",
+        lambda host, port, type: [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", port))
+        ],
+    )
+    assert validate_scan_target(
+        "https://api.example.com/",
+        allowed_hosts=["*.example.com"],
+        allowed_cidrs=["93.184.216.0/24"],
+    ) == "https://api.example.com/"
+    assert validate_scan_target(
+        "https://example.com/",
+        allowed_cidrs=["93.184.216.0/24"],
+    ) == "https://example.com/"
+
+    with pytest.raises(ValueError, match="allowed_hosts"):
+        validate_scan_target("https://example.com/", allowed_hosts=["*.example.com"])
+    with pytest.raises(ValueError, match="allowed_hosts"):
+        validate_scan_target("https://badexample.com/", allowed_hosts=["*.example.com"])
+    with pytest.raises(ValueError, match="allowed_cidrs"):
+        validate_scan_target("https://example.com/", allowed_cidrs=["93.184.217.0/24"])
+    with pytest.raises(ValueError, match="allowed_ports"):
+        validate_scan_target("https://example.com:8443/")
+    assert validate_scan_target(
+        "https://example.com:8443/", allowed_ports=[443, 8443]
+    ) == "https://example.com:8443/"
+
+
+def test_api_scan_routes_enforce_destination_scope_configuration(tmp_path, monkeypatch):
+    config = tmp_path / "scoped-api.yaml"
+    config.write_text(
+        f"""api:
+  allowed_hosts: ['*.scope.example']
+  allowed_cidrs: ['93.184.216.0/24']
+  allowed_ports: [8443]
+storage:
+  type: json
+  path: {tmp_path / 'data'}
+""",
+        encoding="utf-8",
+    )
+    app = create_app(str(config))
+    app.testing = True
+    app.config["API_TOKENS"] = {"scanner": "scan-secret"}
+    monkeypatch.setattr(
+        api_module.socket,
+        "getaddrinfo",
+        lambda host, port, type: [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", port))
+        ],
+    )
+    scanned = []
+
+    def fake_scan(url):
+        scanned.append(url)
+        return dataclasses.replace(_scan_result(None, url), id="scoped-target-01")
+
+    monkeypatch.setattr(app.scanner, "scan", fake_scan)
+    monkeypatch.setattr(app.storage, "save", lambda result: True)
+    client = app.test_client()
+    headers = {"Authorization": "Bearer scan-secret"}
+
+    allowed = client.post(
+        "/api/v1/scan",
+        json={"url": "https://api.scope.example:8443/"},
+        headers=headers,
+    )
+    assert allowed.status_code == 200
+    assert scanned == ["https://api.scope.example:8443/"]
+
+    for url in ("https://scope.example:8443/", "https://api.scope.example:443/"):
+        denied = client.post("/api/v1/scan", json={"url": url}, headers=headers)
+        assert denied.status_code == 400
+    assert scanned == ["https://api.scope.example:8443/"]
+
+
+def test_config_normalizes_api_destination_allowlists(tmp_path):
+    config = tmp_path / "targets.yaml"
+    config.write_text(
+        "api:\n"
+        "  allowed_hosts: ['*.BÜCHER.example', 'example.com']\n"
+        "  allowed_cidrs: ['93.184.216.7/24', '2001:db8::1/64']\n"
+        "  allowed_ports: [443, 8443, 443]\n",
+        encoding="utf-8",
+    )
+    loaded = load_config(str(config))
+    assert loaded["api"]["allowed_hosts"] == ["*.xn--bcher-kva.example", "example.com"]
+    assert loaded["api"]["allowed_cidrs"] == ["2001:db8::/64", "93.184.216.0/24"]
+    assert loaded["api"]["allowed_ports"] == [443, 8443]
+
+
 @pytest.mark.parametrize("days", [-1, 0, 3651, True, "30", 1.5])
 def test_cleanup_rejects_invalid_retention_periods(tmp_path, days):
     config = tmp_path / "config.yaml"
@@ -893,6 +1154,91 @@ def test_api_enforces_configured_scan_rate_limit(tmp_path, monkeypatch):
     assert limited.headers["Retry-After"]
 
 
+def test_api_uses_waitress_instead_of_flask_development_server(monkeypatch):
+    from types import SimpleNamespace
+    import waitress
+
+    fake_app = SimpleNamespace(config={"api": {"host": "127.0.0.1", "port": 5500, "threads": 6}})
+    calls = []
+    monkeypatch.setattr(api_module, "create_app", lambda: fake_app)
+    monkeypatch.setattr(waitress, "serve", lambda app, **kwargs: calls.append((app, kwargs)))
+
+    api_module.run_server()
+    assert calls == [(fake_app, {"host": "127.0.0.1", "port": 5500, "threads": 6})]
+    with pytest.raises(ValueError, match="does not support debug"):
+        api_module.run_server(debug=True)
+
+
+def test_api_trusts_forwarded_client_ip_only_for_configured_proxy_hops(tmp_path):
+    def make_app(path, hops):
+        config = tmp_path / path
+        config.write_text(
+            f"""api:
+  trusted_proxy_hops: {hops}
+storage:
+  type: json
+  path: {tmp_path / (path + '-data')}
+""",
+            encoding="utf-8",
+        )
+        return create_app(str(config))
+
+    trusted_app = make_app("trusted-proxy.yaml", 1)
+    trusted_addresses = []
+    trusted_app.before_request(lambda: trusted_addresses.append(api_module.request.remote_addr)
+                               if api_module.request.endpoint == "health_check" else None)
+    assert trusted_app.test_client().get(
+        "/api/v1/health", headers={"X-Forwarded-For": "198.51.100.24"}
+    ).status_code == 200
+    assert trusted_addresses == ["198.51.100.24"]
+
+    direct_app = make_app("direct.yaml", 0)
+    direct_addresses = []
+    direct_app.before_request(lambda: direct_addresses.append(api_module.request.remote_addr)
+                              if api_module.request.endpoint == "health_check" else None)
+    direct_app.test_client().get(
+        "/api/v1/health", headers={"X-Forwarded-For": "198.51.100.24"}
+    )
+    assert direct_addresses == ["127.0.0.1"]
+
+def test_api_redis_rate_limit_backend_requires_and_checks_shared_store(tmp_path, monkeypatch):
+    import redis
+    from src.rate_limit import RedisRateLimiter
+
+    config = tmp_path / "redis.yaml"
+    config.write_text(
+        f"""api:
+  rate_limit_backend: redis
+storage:
+  type: json
+  path: {tmp_path / 'data'}
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SECURITY_SCANNER_REDIS_URL", "redis://:not-logged@cache.example:6379/0")
+
+    class RedisStub:
+        def __init__(self):
+            self.pinged = False
+
+        def ping(self):
+            self.pinged = True
+
+    client = RedisStub()
+    monkeypatch.setattr(redis.Redis, "from_url", classmethod(lambda cls, url, **kwargs: client))
+    app = create_app(str(config))
+    assert isinstance(app.extensions["scanner_rate_limiter"], RedisRateLimiter)
+    assert app.extensions["scanner_rate_limiter"].redis is client
+    assert client.pinged
+
+    class UnavailableRedis:
+        def ping(self):
+            raise OSError("offline")
+
+    monkeypatch.setattr(redis.Redis, "from_url", classmethod(lambda cls, url, **kwargs: UnavailableRedis()))
+    with pytest.raises(ValueError, match="failed closed"):
+        create_app(str(config))
+
 def test_api_enforces_request_size_and_history_limit_bounds(tmp_path):
     config = tmp_path / "config.yaml"
     config.write_text(
@@ -955,6 +1301,43 @@ def test_api_report_formats_and_scan_role_are_consistent(tmp_path, monkeypatch):
     assert client.post(
         "/api/v1/scan", data="not-json", content_type="text/plain", headers=scanner_headers
     ).status_code == 400
+
+
+def test_api_scan_responses_and_errors_redact_query_secrets_without_altering_target(tmp_path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "storage:\n  type: json\n  path: " + str(tmp_path / "data") + "\n",
+        encoding="utf-8",
+    )
+    app = create_app(str(config))
+    app.testing = True
+    app.config["API_TOKENS"] = {"scanner": "scan-secret"}
+    monkeypatch.setattr(api_module, "validate_scan_target", lambda url, **kwargs: url)
+    targets = []
+    success_url = "https://example.com/check?api_key=response-secret"
+    error_url = "https://example.com/fail?access_token=error-secret"
+
+    def fake_scan(url):
+        targets.append(url)
+        result = dataclasses.replace(_scan_result(None, url), id="scan-" + str(len(targets)))
+        if "/fail" in url:
+            result.error = f"request failed for {url}"
+        return result
+
+    monkeypatch.setattr(app.scanner, "scan", fake_scan)
+    headers = {"Authorization": "Bearer scan-secret"}
+    client = app.test_client()
+    success = client.post("/api/v1/scan", json={"url": success_url}, headers=headers)
+    assert success.status_code == 200
+    assert success.json["url"] == redact_sensitive_url(success_url)
+    assert "response-secret" not in success.get_data(as_text=True)
+
+    failed = client.post("/api/v1/scan", json={"url": error_url}, headers=headers)
+    assert failed.status_code == 500
+    assert failed.json["url"] == redact_sensitive_url(error_url)
+    assert "error-secret" not in failed.get_data(as_text=True)
+    assert "response-secret" not in failed.get_data(as_text=True)
+    assert targets == [success_url, error_url]
 
 
 def test_batch_api_validates_all_targets_before_scanning(tmp_path, monkeypatch):

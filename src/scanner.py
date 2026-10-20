@@ -10,6 +10,7 @@ import threading
 import time
 import requests
 from dataclasses import dataclass, field
+from http.cookies import CookieError, SimpleCookie
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import urlsplit
@@ -23,7 +24,13 @@ from .headers import (
     Severity
 )
 from .analyzer import HeaderAnalyzer
-from .utils import generate_id, normalize_http_url, format_timestamp
+from .utils import (
+    generate_id,
+    normalize_http_url,
+    format_timestamp,
+    redact_sensitive_url,
+    redact_sensitive_urls_in_text,
+)
 from .pinned_http import PinnedAddressAdapter
 
 
@@ -60,6 +67,25 @@ class HeaderResult:
 
 
 @dataclass
+class CookieResult:
+    """Security attributes observed for one Set-Cookie header, without its value."""
+    name: str
+    secure: bool
+    http_only: bool
+    same_site: Optional[str]
+    issues: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "secure": self.secure,
+            "http_only": self.http_only,
+            "same_site": self.same_site,
+            "issues": list(self.issues),
+        }
+
+
+@dataclass
 class ScanResult:
     """Complete result of a security header scan"""
     id: str
@@ -77,18 +103,20 @@ class ScanResult:
     risk_level: str
     summary: Dict[str, int]
     error: Optional[str] = None
+    cookie_results: List[CookieResult] = field(default_factory=list)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""
         return {
             "id": self.id,
-            "url": self.url,
+            "url": redact_sensitive_url(self.url),
             "timestamp": self.timestamp,
             "scan_duration_ms": self.scan_duration_ms,
             "http_status_code": self.http_status_code,
-            "final_url": self.final_url,
+            "final_url": redact_sensitive_url(self.final_url),
             "headers_found": self.headers_found,
             "header_results": [h.to_dict() for h in self.header_results],
+            "cookie_results": [cookie.to_dict() for cookie in self.cookie_results],
             "score": {
                 "total": self.total_score,
                 "max": self.max_score,
@@ -97,7 +125,7 @@ class ScanResult:
             },
             "risk_level": self.risk_level,
             "summary": self.summary,
-            "error": self.error,
+            "error": redact_sensitive_urls_in_text(self.error, (self.url, self.final_url)),
         }
     
     @classmethod
@@ -136,6 +164,17 @@ class ScanResult:
             risk_level=data["risk_level"],
             summary=data["summary"],
             error=data.get("error"),
+            cookie_results=[
+                CookieResult(
+                    name=cookie.get("name", ""),
+                    secure=bool(cookie.get("secure", False)),
+                    http_only=bool(cookie.get("http_only", False)),
+                    same_site=cookie.get("same_site"),
+                    issues=list(cookie.get("issues", [])),
+                )
+                for cookie in data.get("cookie_results", [])
+                if isinstance(cookie, dict)
+            ],
         )
 
 
@@ -249,12 +288,12 @@ class SecurityHeaderScanner:
         """Normalize and validate an HTTP(S) scan URL."""
         return normalize_http_url(url)
     
-    def _get_response_headers(self, url: str) -> Tuple[Optional[int], Dict[str, str], Optional[str], Optional[str]]:
+    def _get_response_headers(self, url: str) -> Tuple[Optional[int], Dict[str, str], Optional[str], Optional[str], List[str]]:
         """
         Fetch response headers with a bounded body and explicit proxy policy.
 
         Returns:
-            Tuple of (status_code, headers_dict, final_url, error_message)
+            Tuple of (status_code, headers_dict, final_url, error_message, set_cookie_values)
         """
         self._rate_limit()
         session = requests.Session()
@@ -287,7 +326,14 @@ class SecurityHeaderScanner:
                     )
                     try:
                         normalized_headers = {key.lower(): value for key, value in response.headers.items()}
-                        return response.status_code, normalized_headers, response.url, None
+                        raw_headers = getattr(getattr(response, "raw", None), "headers", None)
+                        get_all = getattr(raw_headers, "getlist", None)
+                        set_cookie_values = list(get_all("Set-Cookie")) if callable(get_all) else []
+                        if not set_cookie_values:
+                            combined_cookie = normalized_headers.get("set-cookie")
+                            if combined_cookie:
+                                set_cookie_values = [combined_cookie]
+                        return response.status_code, normalized_headers, response.url, None, set_cookie_values
                     finally:
                         response.close()
                 except requests.exceptions.Timeout:
@@ -301,7 +347,7 @@ class SecurityHeaderScanner:
 
                 if attempt < self.max_retries - 1:
                     time.sleep(0.5 * (attempt + 1))
-            return None, {}, None, error
+            return None, {}, None, error, []
         finally:
             session.close()
     
@@ -347,6 +393,51 @@ class SecurityHeaderScanner:
         
         return summary
     
+    def _analyze_cookies(self, set_cookie_values) -> List[CookieResult]:
+        """Analyze Set-Cookie attributes transiently and retain no cookie values."""
+        results = []
+        for raw_cookie in set_cookie_values or ():
+            if not isinstance(raw_cookie, str) or not raw_cookie:
+                continue
+            parsed_cookie = SimpleCookie()
+            try:
+                parsed_cookie.load(raw_cookie)
+            except (CookieError, TypeError, ValueError):
+                parsed_cookie = SimpleCookie()
+            if not parsed_cookie:
+                results.append(CookieResult(
+                    name="<unparsed>",
+                    secure=False,
+                    http_only=False,
+                    same_site=None,
+                    issues=["Set-Cookie header could not be parsed"],
+                ))
+                continue
+            for morsel in parsed_cookie.values():
+                secure = bool(morsel["secure"])
+                http_only = bool(morsel["httponly"])
+                same_site_value = str(morsel["samesite"] or "").strip()
+                same_site = same_site_value.title() if same_site_value else None
+                issues = []
+                if not secure:
+                    issues.append("Missing Secure attribute")
+                if not http_only:
+                    issues.append("Missing HttpOnly attribute")
+                if same_site is None:
+                    issues.append("Missing SameSite attribute")
+                elif same_site.lower() not in {"strict", "lax", "none"}:
+                    issues.append("Unrecognized SameSite value")
+                elif same_site.lower() == "none" and not secure:
+                    issues.append("SameSite=None requires Secure")
+                results.append(CookieResult(
+                    name=morsel.key,
+                    secure=secure,
+                    http_only=http_only,
+                    same_site=same_site,
+                    issues=issues,
+                ))
+        return results
+
     def scan(self, url: str) -> ScanResult:
         """
         Scan a URL for security headers.
@@ -362,8 +453,17 @@ class SecurityHeaderScanner:
         url = self._normalize_url(url)
         
         try:
-            # Fetch headers
-            status_code, headers, final_url, error = self._get_response_headers(url)
+            # Fetch headers and transient Set-Cookie values. Accept the legacy
+            # four-item tuple for custom scanner subclasses and test doubles.
+            response_data = self._get_response_headers(url)
+            if len(response_data) == 4:
+                status_code, headers, final_url, error = response_data
+                set_cookie_values = []
+            else:
+                status_code, headers, final_url, error, set_cookie_values = response_data
+            if not set_cookie_values and headers.get("set-cookie"):
+                set_cookie_values = [headers["set-cookie"]]
+            error = redact_sensitive_urls_in_text(error, (url,))
             
             if error:
                 return ScanResult(
@@ -474,6 +574,7 @@ class SecurityHeaderScanner:
                 grade=grade,
                 risk_level=risk_level,
                 summary=summary,
+                cookie_results=self._analyze_cookies(set_cookie_values),
             )
             
         except Exception as e:
@@ -492,7 +593,7 @@ class SecurityHeaderScanner:
                 grade="F",
                 risk_level="error",
                 summary={"total": 0, "present": 0, "weak": 0, "misconfigured": 0, "missing": 0},
-                error=str(e),
+                error=redact_sensitive_urls_in_text(str(e), (url,)),
             )
     
     def batch_scan(
@@ -541,7 +642,7 @@ class SecurityHeaderScanner:
                     grade="F",
                     risk_level="error",
                     summary={"total": 0, "present": 0, "weak": 0, "misconfigured": 0, "missing": 0},
-                    error=str(exc),
+                    error=redact_sensitive_urls_in_text(str(exc), (url,)),
                 )
             results.append(result)
             if callback is not None:
@@ -584,8 +685,8 @@ class SecurityHeaderScanner:
                 regressed.append(name)
 
         return {
-            "url1": scan1.url,
-            "url2": scan2.url,
+            "url1": redact_sensitive_url(scan1.url),
+            "url2": redact_sensitive_url(scan2.url),
             "score_change": round(scan2.percentage_score - scan1.percentage_score, 1),
             "grade_change": scan2.grade != scan1.grade,
             "grade_from": scan1.grade,
