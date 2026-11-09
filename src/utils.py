@@ -12,13 +12,66 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 import json
 
 
 def generate_id() -> str:
     """Generate a collision-resistant, UUID-based scan ID."""
     return str(uuid.uuid4())
+
+
+_SENSITIVE_QUERY_COMPONENTS = {
+    "auth", "authorization", "cookie", "credential", "jwt", "key", "password",
+    "passwd", "pwd", "secret", "session", "signature", "sig", "token",
+}
+_SENSITIVE_QUERY_COMPOUNDS = {
+    "accesskey", "apikey", "clientsecret", "idtoken", "privatekey", "refreshtoken",
+}
+_URL_IN_TEXT_RE = re.compile(r"(?i)https?://\S+")
+
+
+def _is_sensitive_query_key(raw_key: str) -> bool:
+    key = unquote_plus(raw_key)
+    key = re.sub(r"([a-z0-9])([A-Z])", lambda match: match.group(1) + "_" + match.group(2), key).lower()
+    parts = [part for part in re.split(r"[^a-z0-9]+", key) if part]
+    components = set(parts)
+    compact = "".join(parts)
+    return bool(components & _SENSITIVE_QUERY_COMPONENTS) or compact in _SENSITIVE_QUERY_COMPOUNDS
+
+
+def redact_sensitive_url(url: Optional[str]) -> Optional[str]:
+    """Redact values of sensitive query parameters without changing the scan URL."""
+    if not isinstance(url, str):
+        return url
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return url
+    pieces = re.split(r"([&;])", parsed.query)
+    for index in range(0, len(pieces), 2):
+        if not pieces[index]:
+            continue
+        raw_key, separator, _ = pieces[index].partition("=")
+        if _is_sensitive_query_key(raw_key):
+            pieces[index] = raw_key + (separator or "=") + "%5BREDACTED%5D"
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "".join(pieces), parsed.fragment))
+
+
+def redact_sensitive_urls_in_text(text: Optional[str], known_urls=()) -> Optional[str]:
+    """Redact query secrets in URLs embedded in exception or diagnostic text."""
+    if not isinstance(text, str):
+        return text
+    safe_text = text
+    for url in known_urls:
+        if isinstance(url, str) and url:
+            safe_text = safe_text.replace(url, redact_sensitive_url(url))
+    return _URL_IN_TEXT_RE.sub(lambda match: redact_sensitive_url(match.group(0)), safe_text)
+
+
+def url_lookup_key(url: str) -> str:
+    """Return a case-insensitive opaque key for URL history matching."""
+    return hashlib.sha256(url.casefold().encode("utf-8")).hexdigest()
 
 
 def format_timestamp(dt: Optional[datetime] = None) -> str:

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 from .scanner import ScanResult
+from .utils import redact_sensitive_url, url_lookup_key
 
 try:
     import fcntl
@@ -134,9 +135,31 @@ class JSONStorage(Storage):
         try:
             with open(self.index_file, "r", encoding="utf-8") as handle:
                 data = json.load(handle)
-            return data if isinstance(data, dict) else {}
+            if not isinstance(data, dict):
+                return {}
         except (OSError, json.JSONDecodeError, TypeError):
             return {}
+
+        # Migrate older indexes in place: keep only a redacted display URL and
+        # an opaque case-insensitive lookup key for history queries.
+        changed = False
+        for info in data.values():
+            if not isinstance(info, dict) or not isinstance(info.get("url"), str):
+                continue
+            raw_url = info["url"]
+            lookup_key = info.get("url_lookup_key")
+            if not isinstance(lookup_key, str) or not re.fullmatch(r"[0-9a-f]{64}", lookup_key):
+                lookup_key = url_lookup_key(raw_url)
+            safe_url = redact_sensitive_url(raw_url)
+            if info.get("url_lookup_key") != lookup_key:
+                info["url_lookup_key"] = lookup_key
+                changed = True
+            if safe_url != raw_url:
+                info["url"] = safe_url
+                changed = True
+        if changed:
+            self._save_index(data)
+        return data
 
     def _atomic_write_json(self, path: Path, value: Any):
         temp_path = None
@@ -164,8 +187,14 @@ class JSONStorage(Storage):
 
     def _read_result(self, scan_id: str) -> Optional[ScanResult]:
         try:
-            with open(self._get_scan_file(scan_id), "r", encoding="utf-8") as handle:
-                return ScanResult.from_dict(json.load(handle))
+            path = self._get_scan_file(scan_id)
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            result = ScanResult.from_dict(data)
+            safe_data = result.to_dict()
+            if safe_data != data:
+                self._atomic_write_json(path, safe_data)
+            return result
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             return None
 
@@ -236,7 +265,8 @@ class JSONStorage(Storage):
                 self._atomic_write_json(self._get_scan_file(result.id), result.to_dict())
                 index = self._load_index()
                 index[result.id] = {
-                    "url": result.url,
+                    "url": redact_sensitive_url(result.url),
+                    "url_lookup_key": url_lookup_key(result.url),
                     "timestamp": result.timestamp,
                     "percentage_score": result.percentage_score,
                     "grade": result.grade,
@@ -282,9 +312,13 @@ class JSONStorage(Storage):
             return []
         with self._locked():
             index = self._load_index()
+            lookup_key = url_lookup_key(url)
             matching = [
                 (scan_id, info) for scan_id, info in index.items()
-                if isinstance(info, dict) and str(info.get("url", "")).lower() == url.lower()
+                if isinstance(info, dict) and (
+                    info.get("url_lookup_key") == lookup_key
+                    or str(info.get("url", "")).lower() == url.lower()
+                )
             ]
             ordered = [
                 item for _, item in sorted(
@@ -381,6 +415,7 @@ class SQLiteStorage(Storage):
                 CREATE TABLE IF NOT EXISTS scans (
                     id TEXT PRIMARY KEY,
                     url TEXT NOT NULL,
+                    url_lookup_key TEXT,
                     timestamp TEXT NOT NULL,
                     scan_duration_ms REAL,
                     http_status_code INTEGER,
@@ -396,7 +431,41 @@ class SQLiteStorage(Storage):
                     scan_data TEXT
                 )
             """)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(scans)").fetchall()}
+            legacy_schema = "url_lookup_key" not in columns
+            if legacy_schema:
+                conn.execute("ALTER TABLE scans ADD COLUMN url_lookup_key TEXT")
+
+            # Upgrade older databases in place so their retained URL and error
+            # fields are redacted too, without breaking exact history lookups.
+            # The full-table conversion runs only once; subsequent startups only
+            # repair any rows left without a lookup key.
+            query = "SELECT id, url, url_lookup_key, final_url, error, scan_data FROM scans"
+            if not legacy_schema:
+                query += " WHERE url_lookup_key IS NULL"
+            rows = conn.execute(query).fetchall()
+            for scan_id, raw_url, lookup_key, final_url, error, scan_data in rows:
+                safe_url = redact_sensitive_url(raw_url)
+                new_lookup_key = lookup_key or url_lookup_key(raw_url)
+                safe_final_url = redact_sensitive_url(final_url)
+                safe_error = error
+                safe_data = scan_data
+                try:
+                    result = ScanResult.from_dict(json.loads(scan_data))
+                    safe_data = json.dumps(result.to_dict())
+                    safe_error = result.to_dict().get("error")
+                except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+                    pass
+                if (
+                    safe_url != raw_url or new_lookup_key != lookup_key
+                    or safe_final_url != final_url or safe_error != error or safe_data != scan_data
+                ):
+                    conn.execute(
+                        "UPDATE scans SET url = ?, url_lookup_key = ?, final_url = ?, error = ?, scan_data = ? WHERE id = ?",
+                        (safe_url, new_lookup_key, safe_final_url, safe_error, safe_data, scan_id),
+                    )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_url ON scans(url)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_url_lookup_key ON scans(url_lookup_key)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON scans(timestamp)")
             self._apply_retention(conn, self.auto_cleanup_days)
 
@@ -423,17 +492,18 @@ class SQLiteStorage(Storage):
             with self._lock, self._connection() as conn:
                 conn.execute("""
                     INSERT OR REPLACE INTO scans
-                    (id, url, timestamp, scan_duration_ms, http_status_code, final_url,
-                     headers_found, total_score, max_score, percentage_score, grade,
-                     risk_level, summary, error, scan_data)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, url, url_lookup_key, timestamp, scan_duration_ms, http_status_code,
+                     final_url, headers_found, total_score, max_score, percentage_score,
+                     grade, risk_level, summary, error, scan_data)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     result.id,
-                    result.url,
+                    data["url"],
+                    url_lookup_key(result.url),
                     result.timestamp,
                     result.scan_duration_ms,
                     result.http_status_code,
-                    result.final_url,
+                    data["final_url"],
                     json.dumps(result.headers_found),
                     result.total_score,
                     result.max_score,
@@ -441,7 +511,7 @@ class SQLiteStorage(Storage):
                     result.grade,
                     result.risk_level,
                     json.dumps(result.summary),
-                    result.error,
+                    data["error"],
                     json.dumps(data),
                 ))
                 self._apply_retention(conn, self.auto_cleanup_days)
@@ -485,9 +555,10 @@ class SQLiteStorage(Storage):
         try:
             with self._connection() as conn:
                 rows = conn.execute(
-                    "SELECT scan_data FROM scans WHERE url = ? COLLATE NOCASE "
+                    "SELECT scan_data FROM scans WHERE url_lookup_key = ? "
+                    "OR (url_lookup_key IS NULL AND url = ? COLLATE NOCASE) "
                     "ORDER BY timestamp DESC, rowid DESC LIMIT ?",
-                    (url, limit),
+                    (url_lookup_key(url), url, limit),
                 ).fetchall()
             for row in rows:
                 results.append(ScanResult.from_dict(json.loads(row[0])))

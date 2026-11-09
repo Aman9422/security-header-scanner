@@ -7,9 +7,11 @@ pyyaml>=6.0.1
 colorama>=0.4.6
 beautifulsoup4>=4.12.0
 
-# API framework
+# API framework and production WSGI server
 flask>=3.0.0
 flask-cors>=4.0.0
+waitress>=3.0.0
+redis>=5.0.0
 
 # Certificate parsing
 cryptography>=42.0.0
@@ -21,6 +23,10 @@ pydantic>=2.5.0
 pytest>=7.4.0
 pytest-cov>=4.1.0
 responses>=0.24.0
+# Explicitly lock pytest's Python <3.11 compatibility dependencies. The lock is
+# compiled with Python 3.11, so conditional transitive requirements are otherwise omitted.
+exceptiongroup>=1.3.1
+tomli>=2.2.1
 
 # Optional
 jinja2>=3.1.2

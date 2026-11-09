@@ -41,7 +41,7 @@ from src.reporter import ReportGenerator
 from src.storage import get_storage
 from src.headers import HeaderStatus
 from src.config import load_config as _load_shared_config
-from src.utils import normalize_http_url
+from src.utils import normalize_http_url, redact_sensitive_url
 
 
 console = Console()
@@ -91,7 +91,7 @@ def scan(url: str, verbose: bool, format: str, output: str):
     
     reporter = ReportGenerator()
     
-    console.print(f"\n🔍 Scanning headers: {url}\n", markup=False)
+    console.print(f"\n🔍 Scanning headers: {redact_sensitive_url(url)}\n", markup=False)
     
     with Progress(
         SpinnerColumn(),
@@ -110,7 +110,7 @@ def scan(url: str, verbose: bool, format: str, output: str):
     report = reporter.generate(result, format)
     if verbose and format == "text":
         details = [
-            "", "VERBOSE DETAILS", f"Final URL: {result.final_url or 'N/A'}",
+            "", "VERBOSE DETAILS", f"Final URL: {redact_sensitive_url(result.final_url) or 'N/A'}",
             f"HTTP status: {result.http_status_code or 'N/A'}",
             f"Duration: {result.scan_duration_ms:.1f} ms", "Security response headers:",
         ]
@@ -680,20 +680,14 @@ def headers():
 @click.option("--host", "-h", default=None, help="Override api.host from config.yaml")
 @click.option("--port", "-p", type=click.IntRange(1, 65535), default=None, help="Override api.port from config.yaml")
 def serve(host: Optional[str], port: Optional[int]):
-    """Start the REST API server using validated configuration."""
-    from src.api import create_app
+    """Start the REST API with the production Waitress WSGI server."""
+    from src.api import run_server
     config = load_config()
     api_config = config["api"]
-    bind_host = host or api_config["host"]
-    bind_port = port or api_config["port"]
-    console.print(f"\n🚀 Starting API server on {bind_host}:{bind_port}\n")
-    app = create_app()
-    app.run(
-        host=bind_host,
-        port=bind_port,
-        debug=api_config["debug"],
-        threaded=api_config["threaded"],
-    )
+    bind_host = host if host is not None else api_config["host"]
+    bind_port = port if port is not None else api_config["port"]
+    console.print(f"\n🚀 Starting API server on {bind_host}:{bind_port} (Waitress)\n")
+    run_server(host=bind_host, port=bind_port)
 
 
 def main():

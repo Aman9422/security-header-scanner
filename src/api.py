@@ -9,19 +9,19 @@ import hmac
 import ipaddress
 import os
 import socket
-import threading
-import time
 from typing import Dict, Any, Optional
 from urllib.parse import urlsplit
 
 from flask import Flask, request, jsonify, Response, g
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 from .config import load_config
 from .scanner import SecurityHeaderScanner
 from .analyzer import HeaderAnalyzer
 from .reporter import ReportGenerator
+from .rate_limit import MemoryRateLimiter, RedisRateLimiter
 from .storage import get_storage
-from .utils import normalize_http_url
+from .utils import normalize_http_url, redact_sensitive_url, redact_sensitive_urls_in_text
 
 
 def create_app(config_path: Optional[str] = None) -> Flask:
@@ -43,8 +43,12 @@ def create_app(config_path: Optional[str] = None) -> Flask:
     app.config.update(config)
     app.config["MAX_CONTENT_LENGTH"] = api_config.get("max_request_bytes", 1_048_576)
     app.config["API_TOKENS"] = _load_api_tokens()
-    app.extensions["scanner_rate_buckets"] = {}
-    app.extensions["scanner_rate_lock"] = threading.Lock()
+    app.extensions["scanner_rate_limiter"] = _create_rate_limiter(api_config)
+    trusted_proxy_hops = api_config.get("trusted_proxy_hops", 0)
+    if trusted_proxy_hops:
+        # Trust only the configured number of proxy hops for client-IP policy;
+        # X-Forwarded-For is ignored completely when the default is zero.
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=trusted_proxy_hops)
     origins = api_config.get("cors_origins", [])
     if origins:
         CORS(app, origins=origins, supports_credentials=False)
@@ -69,7 +73,12 @@ def create_app(config_path: Optional[str] = None) -> Flask:
         follow_redirects=False,
         trust_env=False,
         address_resolver=lambda host, port: _resolve_target_addresses(
-            host, port, api_config["allow_private_networks"]
+            host,
+            port,
+            api_config["allow_private_networks"],
+            allowed_hosts=api_config["allowed_hosts"],
+            allowed_cidrs=api_config["allowed_cidrs"],
+            allowed_ports=api_config["allowed_ports"],
         ),
     )
     reporter = ReportGenerator()
@@ -139,12 +148,89 @@ def _load_api_tokens() -> Dict[str, str]:
     return {role: token for role, token in tokens.items() if token}
 
 
-def _resolve_target_addresses(host: str, port: int, allow_private_networks: bool = False):
+def _host_matches_allowlist(host: str, allowed_hosts) -> bool:
+    """Match an exact hostname or a ``*.example.com`` subdomain pattern."""
+    if not allowed_hosts:
+        return True
+    try:
+        normalized_host = ipaddress.ip_address(host).compressed.lower()
+    except ValueError:
+        try:
+            normalized_host = host.rstrip(".").encode("idna").decode("ascii").lower()
+        except UnicodeError:
+            return False
+    for pattern in allowed_hosts:
+        if not isinstance(pattern, str):
+            continue
+        if pattern.startswith("*."):
+            suffix = pattern[2:].lower()
+            if normalized_host.endswith("." + suffix) and normalized_host != suffix:
+                return True
+        elif normalized_host == pattern.lower():
+            return True
+    return False
+
+
+def _create_rate_limiter(api_config: Dict[str, Any]):
+    """Build the configured rate limiter, requiring Redis connectivity at startup."""
+    backend = api_config.get("rate_limit_backend", "memory")
+    if backend == "memory":
+        return MemoryRateLimiter()
+    if backend != "redis":
+        raise ValueError("api.rate_limit_backend must be 'memory' or 'redis'")
+
+    redis_url = os.environ.get("SECURITY_SCANNER_REDIS_URL", "").strip()
+    try:
+        parsed = urlsplit(redis_url)
+        if parsed.scheme not in {"redis", "rediss"} or not parsed.hostname:
+            raise ValueError
+        parsed.port  # Force validation of malformed port strings.
+    except ValueError:
+        raise ValueError(
+            "Redis rate limiting requires SECURITY_SCANNER_REDIS_URL with a redis:// or rediss:// URL"
+        ) from None
+    try:
+        import redis
+    except ImportError as exc:
+        raise ValueError("Redis rate limiting requires the redis Python package") from exc
+    try:
+        client = redis.Redis.from_url(
+            redis_url,
+            socket_timeout=2,
+            socket_connect_timeout=2,
+            health_check_interval=30,
+            decode_responses=True,
+        )
+        client.ping()
+    except Exception:
+        raise ValueError("Redis rate-limit backend is unavailable; API startup failed closed") from None
+    return RedisRateLimiter(client)
+
+
+def _resolve_target_addresses(
+    host: str,
+    port: int,
+    allow_private_networks: bool = False,
+    allowed_hosts=None,
+    allowed_cidrs=None,
+    allowed_ports=None,
+):
     """Resolve a host once and return only addresses allowed by SSRF policy."""
     if not isinstance(allow_private_networks, bool):
         raise ValueError("allow_private_networks must be a boolean")
     if not isinstance(host, str) or not host or isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError("Target hostname and port are invalid")
+    allowed_ports = (80, 443) if allowed_ports is None else allowed_ports
+    if port not in allowed_ports:
+        raise ValueError("Target port is not in api.allowed_ports")
+    if not _host_matches_allowlist(host, allowed_hosts or ()):
+        raise ValueError("Target hostname is not in api.allowed_hosts")
+
+    try:
+        networks = tuple(ipaddress.ip_network(network, strict=False) for network in (allowed_cidrs or ()))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("API CIDR allowlist is invalid") from exc
+
     try:
         try:
             addresses = [ipaddress.ip_address(host)]
@@ -158,17 +244,36 @@ def _resolve_target_addresses(host: str, port: int, allow_private_networks: bool
     if not addresses:
         raise ValueError("Target hostname has no usable address")
 
+    def mapped_ipv4(address):
+        return address.ipv4_mapped if isinstance(address, ipaddress.IPv6Address) else None
+
     def is_global(address):
-        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
-            address = address.ipv4_mapped
-        return address.is_global
+        return (mapped_ipv4(address) or address).is_global
 
     if not allow_private_networks and any(not is_global(address) for address in addresses):
         raise ValueError("Private, loopback, link-local, and reserved targets are disabled")
+
+    if networks and any(
+        not any(
+            address.version == network.version and address in network
+            or mapped_ipv4(address) is not None
+            and mapped_ipv4(address).version == network.version
+            and mapped_ipv4(address) in network
+            for network in networks
+        )
+        for address in addresses
+    ):
+        raise ValueError("One or more resolved addresses are not in api.allowed_cidrs")
     return tuple(str(address) for address in addresses)
 
 
-def validate_scan_target(url: Any, allow_private_networks: bool = False) -> str:
+def validate_scan_target(
+    url: Any,
+    allow_private_networks: bool = False,
+    allowed_hosts=None,
+    allowed_cidrs=None,
+    allowed_ports=None,
+) -> str:
     """Canonicalize an API target and reject local/private destinations by default.
 
     DNS answers are checked here and again immediately before a request; the HTTP
@@ -198,7 +303,14 @@ def validate_scan_target(url: Any, allow_private_networks: bool = False) -> str:
     host = parsed.hostname
     if not host:
         raise ValueError("URL must include a hostname")
-    _resolve_target_addresses(host, port, allow_private_networks)
+    _resolve_target_addresses(
+        host,
+        port,
+        allow_private_networks,
+        allowed_hosts=allowed_hosts,
+        allowed_cidrs=allowed_cidrs,
+        allowed_ports=allowed_ports,
+    )
     return normalized_url
 
 
@@ -265,27 +377,18 @@ def _register_routes(app: Flask):
             if cost > limit:
                 return jsonify({"error": "Rate limit exceeded", "limit": limit}), 429, {"Retry-After": "60"}
 
-            now = time.monotonic()
-            cutoff = now - 60
-            key = request.remote_addr or "unknown"
-            buckets = app.extensions["scanner_rate_buckets"]
-            with app.extensions["scanner_rate_lock"]:
-                for bucket_key, entries in list(buckets.items()):
-                    active = [(stamp, amount) for stamp, amount in entries if stamp > cutoff]
-                    if active:
-                        buckets[bucket_key] = active
-                    else:
-                        buckets.pop(bucket_key, None)
-                entries = buckets.setdefault(key, [])
-                used = sum(amount for _, amount in entries)
-                if used + cost > limit:
-                    retry_after = max(1, int(entries[0][0] + 60 - now)) if entries else 60
-                    return jsonify({
-                        "error": "Rate limit exceeded",
-                        "limit": limit,
-                        "retry_after_seconds": retry_after,
-                    }), 429, {"Retry-After": str(retry_after)}
-                entries.append((now, cost))
+            client_key = request.remote_addr or "unknown"
+            try:
+                retry_after = app.extensions["scanner_rate_limiter"].consume(client_key, cost, limit)
+            except Exception:
+                app.logger.error("Rate-limit backend unavailable; denying scan request")
+                return jsonify({"error": "Rate-limit service unavailable"}), 503
+            if retry_after is not None:
+                return jsonify({
+                    "error": "Rate limit exceeded",
+                    "limit": limit,
+                    "retry_after_seconds": retry_after,
+                }), 429, {"Retry-After": str(retry_after)}
         return None
 
     @app.route("/api/v1/health", methods=["GET"])
@@ -314,16 +417,23 @@ def _register_routes(app: Flask):
         if format_type not in REPORT_FORMAT_MIMETYPES:
             return jsonify({"error": "Unsupported format", "supported": sorted(REPORT_FORMAT_MIMETYPES)}), 400
         try:
+            api_config = app.config.get("api", {})
             url = validate_scan_target(
                 url,
-                allow_private_networks=app.config.get("api", {}).get("allow_private_networks", False),
+                allow_private_networks=api_config.get("allow_private_networks", False),
+                allowed_hosts=api_config.get("allowed_hosts", []),
+                allowed_cidrs=api_config.get("allowed_cidrs", []),
+                allowed_ports=api_config.get("allowed_ports", [80, 443]),
             )
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
 
         result = app.scanner.scan(url)
         if result.error:
-            return jsonify({"error": result.error, "url": url}), 500
+            return jsonify({
+                "error": redact_sensitive_urls_in_text(result.error, (url,)),
+                "url": redact_sensitive_url(url),
+            }), 500
 
         app.storage.save(result)
         return _report_response(app, result, format_type)
@@ -362,7 +472,7 @@ def _register_routes(app: Flask):
         results = app.storage.get_by_url(url, limit)
         
         return jsonify({
-            "url": url,
+            "url": redact_sensitive_url(url),
             "count": len(results),
             "scans": [r.to_dict() for r in results],
         })
@@ -398,10 +508,17 @@ def _register_routes(app: Flask):
         # Pre-validate every target before any outbound request to prevent a
         # mixed public/private batch from partially executing.
         validated_urls = []
-        allow_private = app.config.get("api", {}).get("allow_private_networks", False)
+        api_config = app.config.get("api", {})
+        allow_private = api_config.get("allow_private_networks", False)
         for index, url in enumerate(urls):
             try:
-                validated_urls.append(validate_scan_target(url, allow_private_networks=allow_private))
+                validated_urls.append(validate_scan_target(
+                    url,
+                    allow_private_networks=allow_private,
+                    allowed_hosts=api_config.get("allowed_hosts", []),
+                    allowed_cidrs=api_config.get("allowed_cidrs", []),
+                    allowed_ports=api_config.get("allowed_ports", [80, 443]),
+                ))
             except ValueError as exc:
                 return jsonify({"error": f"Invalid URL at index {index}: {exc}", "index": index}), 400
 
@@ -516,12 +633,16 @@ def _register_routes(app: Flask):
 
 
 def run_server(host: Optional[str] = None, port: Optional[int] = None, debug: Optional[bool] = None):
-    """Run the API server using validated configuration unless overridden."""
+    """Run the API with Waitress, a production WSGI server."""
+    if debug:
+        raise ValueError("The production API server does not support debug mode")
+    from waitress import serve
+
     app = create_app()
     api_config = app.config["api"]
-    app.run(
-        host=host or api_config["host"],
-        port=port or api_config["port"],
-        debug=api_config["debug"] if debug is None else debug,
-        threaded=api_config["threaded"],
+    serve(
+        app,
+        host=host if host is not None else api_config["host"],
+        port=port if port is not None else api_config["port"],
+        threads=api_config["threads"],
     )

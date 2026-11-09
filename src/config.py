@@ -31,8 +31,16 @@ DEFAULT_CONFIG = {
         "port": 5000,
         "debug": False,
         "threaded": True,
+        "threads": 8,
+        "trusted_proxy_hops": 0,
+        "rate_limit_backend": "memory",
         "cors_origins": [],
         "allow_private_networks": False,
+        # Empty host/CIDR allowlists retain the public-internet scan mode;
+        # configure one or both to scope a shared deployment's targets.
+        "allowed_hosts": [],
+        "allowed_cidrs": [],
+        "allowed_ports": [80, 443],
         "max_request_bytes": 1_048_576,
         "max_urls_per_minute": 30,
     },
@@ -98,6 +106,34 @@ def _valid_host(host: str) -> bool:
     )
 
 
+def _normalize_allowlist_host(value: str) -> str:
+    """Normalize an exact hostname or ``*.example.com`` pattern."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError("api.allowed_hosts entries must be hostnames or *.domain patterns")
+    wildcard = value.startswith("*.")
+    hostname = value[2:] if wildcard else value
+    if not hostname or "*" in hostname or any(ord(character) < 33 for character in hostname):
+        raise ValueError(f"Invalid API hostname allowlist entry: {value!r}")
+    hostname = hostname.rstrip(".")
+    try:
+        try:
+            hostname = ipaddress.ip_address(hostname).compressed.lower()
+        except ValueError:
+            hostname = hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise ValueError(f"Invalid API hostname allowlist entry: {value!r}") from exc
+    if not _valid_host(hostname):
+        raise ValueError(f"Invalid API hostname allowlist entry: {value!r}")
+    if wildcard:
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("Wildcard API hostname entries cannot be IP addresses")
+    return f"*.{hostname}" if wildcard else hostname
+
+
 def _validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
     for section in ("scanner", "storage", "api", "thresholds"):
         if not isinstance(config.get(section), dict):
@@ -131,9 +167,43 @@ def _validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
     _require_int(config, "port", "api", 1, 65535)
     _require_int(config, "max_request_bytes", "api", 1, 10 * 1024 * 1024)
     _require_int(config, "max_urls_per_minute", "api", 1, 100_000)
+    _require_int(config, "threads", "api", 1, 256)
+    _require_int(config, "trusted_proxy_hops", "api", 0, 5)
     for key in ("debug", "threaded", "allow_private_networks"):
         if not isinstance(api.get(key), bool):
             raise ValueError(f"api.{key} must be a boolean")
+    if api["debug"]:
+        raise ValueError("api.debug is disabled; the API runs under a production WSGI server")
+    rate_limit_backend = api.get("rate_limit_backend")
+    if not isinstance(rate_limit_backend, str) or rate_limit_backend.lower() not in {"memory", "redis"}:
+        raise ValueError("api.rate_limit_backend must be 'memory' or 'redis'")
+    api["rate_limit_backend"] = rate_limit_backend.lower()
+
+    allowed_hosts = api.get("allowed_hosts")
+    if not isinstance(allowed_hosts, list) or len(allowed_hosts) > 256:
+        raise ValueError("api.allowed_hosts must be a list of at most 256 host patterns")
+    api["allowed_hosts"] = sorted({_normalize_allowlist_host(value) for value in allowed_hosts})
+
+    allowed_cidrs = api.get("allowed_cidrs")
+    if not isinstance(allowed_cidrs, list) or len(allowed_cidrs) > 256:
+        raise ValueError("api.allowed_cidrs must be a list of at most 256 IP networks")
+    normalized_cidrs = set()
+    for value in allowed_cidrs:
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise ValueError("api.allowed_cidrs entries must be IPv4 or IPv6 CIDR strings")
+        try:
+            normalized_cidrs.add(str(ipaddress.ip_network(value, strict=False)))
+        except ValueError as exc:
+            raise ValueError(f"Invalid API CIDR allowlist entry: {value!r}") from exc
+    api["allowed_cidrs"] = sorted(normalized_cidrs)
+
+    allowed_ports = api.get("allowed_ports")
+    if not isinstance(allowed_ports, list) or len(allowed_ports) > 65535:
+        raise ValueError("api.allowed_ports must be a list of TCP ports")
+    if any(isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535 for port in allowed_ports):
+        raise ValueError("api.allowed_ports entries must be integers between 1 and 65535")
+    api["allowed_ports"] = sorted(set(allowed_ports))
+
     origins = api.get("cors_origins")
     if not isinstance(origins, list) or any(not isinstance(origin, str) for origin in origins):
         raise ValueError("api.cors_origins must be a list of HTTP(S) origins")
