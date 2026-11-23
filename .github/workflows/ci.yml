@@ -2,15 +2,25 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
+    tags: ['v*']
   pull_request:
-    branches: [ main, master ]
+    branches: [main, master]
   schedule:
     - cron: '17 8 * * 1'
 
+# All jobs begin with read-only repository access. The image publishing job
+# adds packages: write only when a validated version tag is pushed.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    name: Run Tests (Python ${{ matrix.python-version }})
+    name: Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -18,23 +28,23 @@ jobs:
         python-version: ['3.10', '3.11', '3.12']
 
     steps:
-      - name: Checkout code
+      - name: Check out source
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: 'pip'
+          cache: pip
           cache-dependency-path: requirements.lock
 
-      - name: Install locked dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install --require-hashes -r requirements.lock
+      - name: Install hash-locked dependencies
+        run: python -m pip install --require-hashes -r requirements.lock
 
       - name: Run tests with coverage
-        run: pytest tests/ -v --cov=src --cov-report=xml --cov-report=html
+        run: python -m pytest tests/ -v --cov=src --cov-report=xml --cov-report=html
 
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.11'
@@ -43,55 +53,107 @@ jobs:
           file: ./coverage.xml
           fail_ci_if_error: false
 
-  lint:
+  quality:
     name: Code Quality
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Check out source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install linting tools
-        run: pip install flake8 black isort
+      - name: Install pinned quality tools
+        run: >-
+          python -m pip install --disable-pip-version-check
+          flake8==7.4.1 black==26.10.1 isort==9.0.2
 
-      - name: Check Python syntax
-        run: flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics
+      - name: Run Flake8 syntax and undefined-name checks
+        run: >-
+          flake8 main.py src/ tests/ --count
+          --select=E9,F63,F7,F82 --show-source --statistics
 
-      - name: Check code formatting
-        run: isort --check-only --diff src/ tests/ || true
+      # The repository contains legacy Python that is not uniformly Black/isort
+      # formatted. Enforce both formatters for Python files changed by this push
+      # or PR instead of creating a large unrelated formatting-only diff.
+      - name: Check Black and isort on changed Python files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_files=()
+          diff_args=()
+          use_tree_listing=false
+          changed_files_file="$(mktemp)"
+          trap 'rm -f "$changed_files_file"' EXIT
 
-      - name: Check black formatting
-        run: black --check src/ tests/ || true
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            diff_args=("$BASE_SHA...$GITHUB_SHA")
+          elif [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+              if git rev-parse --verify "${GITHUB_SHA}^" >/dev/null 2>&1; then
+                diff_args=("${GITHUB_SHA}^" "$GITHUB_SHA")
+              else
+                use_tree_listing=true
+              fi
+            elif [[ "$BASE_SHA" =~ ^0+$ ]]; then
+              use_tree_listing=true
+            else
+              diff_args=("$BASE_SHA" "$GITHUB_SHA")
+            fi
+          else
+            echo "Scheduled run has no code delta; skipping changed-file format checks."
+            exit 0
+          fi
+
+          if [[ "$use_tree_listing" == "true" ]]; then
+            git ls-tree -rz --name-only --full-tree "$GITHUB_SHA" -- '*.py' > "$changed_files_file"
+          else
+            git diff --name-only -z --diff-filter=ACMRT "${diff_args[@]}" -- '*.py' > "$changed_files_file"
+          fi
+          mapfile -d '' -t python_files < "$changed_files_file"
+
+          if [[ ${#python_files[@]} -eq 0 ]]; then
+            echo "No changed Python files; Black and isort checks are not applicable."
+            exit 0
+          fi
+
+          isort --profile black --check-only --diff "${python_files[@]}"
+          black --check "${python_files[@]}"
 
   security-scan:
     name: Security and Dependency Scan
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Check out source
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+          cache: pip
           cache-dependency-path: requirements.lock
 
-      - name: Install locked application dependencies
+      - name: Install hash-locked application dependencies
         id: install-locked-dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install --require-hashes -r requirements.lock
+        run: python -m pip install --require-hashes -r requirements.lock
 
       - name: Install pinned security tools
         id: install-security-tools
-        run: pip install bandit==1.9.4 pip-audit==2.10.1
+        run: >-
+          python -m pip install --disable-pip-version-check
+          bandit==1.9.4 pip-audit==2.10.1
 
       - name: Run Bandit (fail on medium/high-confidence findings)
         run: bandit -r src/ --severity-level medium --confidence-level medium -f json -o security-report.json
@@ -109,29 +171,138 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  build-documentation:
-    name: Build Documentation
+  cli-validation:
+    name: CLI Smoke Tests
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Check out source
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+          cache: pip
           cache-dependency-path: requirements.lock
 
-      - name: Install locked dependencies
-        run: pip install --require-hashes -r requirements.lock
+      - name: Install hash-locked dependencies
+        run: python -m pip install --require-hashes -r requirements.lock
 
       - name: Test CLI help
         run: python main.py --help
 
-      - name: List headers
+      - name: List security headers
         run: python main.py headers
 
-      - name: Test scan functionality
+      - name: Scan sample website
         run: python main.py scan https://example.com --format json
+
+  docker-build:
+    name: Build and Smoke-Test Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build local validation image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          tags: security-header-scanner:ci
+          load: true
+          push: false
+
+      - name: Verify image runs as non-root
+        shell: bash
+        run: test "$(docker image inspect --format '{{.Config.User}}' security-header-scanner:ci)" = "scanner"
+
+      - name: Test container CLI help
+        run: docker run --rm security-header-scanner:ci --help
+
+      - name: List headers in the container
+        run: docker run --rm security-header-scanner:ci headers
+
+      - name: Scan sample website in the container
+        run: docker run --rm security-header-scanner:ci scan https://example.com --format json
+
+  publish-image:
+    name: Publish Versioned Image to GHCR
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [test, quality, security-scan, cli-validation, docker-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate release tag and merged commit
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tags must use vMAJOR.MINOR.PATCH (for example v1.0.0)." >&2
+            exit 1
+          fi
+          git fetch --no-tags origin "refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH"; then
+            echo "Refusing to publish: tag commit is not contained in the default branch." >&2
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate lowercase image name
+        id: image
+        env:
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: echo "name=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Docker image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=ref,event=tag
+            type=raw,value=latest
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
