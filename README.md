@@ -4,8 +4,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)]()
-[![Code Quality](https://img.shields.io/badge/Quality-A%2B-brightgreen.svg)]()
+[![CI/CD Pipeline](https://github.com/Aman9422/security-header-scanner/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Aman9422/security-header-scanner/actions/workflows/ci.yml)
 
 
 
@@ -18,15 +17,17 @@
 | Feature | Description | Command |
 |---------|-------------|---------|
 | 🔐 **Security Headers** | Checks 9 modern security headers by default | `scan` |
-| 🔒 **SSL/TLS Analysis** | Certificate & protocol validation | `ssl` |
+| 🍪 **Cookie Attributes** | Reports Secure, HttpOnly, and SameSite findings without storing values | `scan` |
+| 🔒 **SSL/TLS Analysis** | Certificate, hostname, trust, protocol, and cipher checks | `ssl` |
 | 🔎 **Tech Fingerprinting** | Identifies frameworks & libraries | `fingerprint` |
 | 🌐 **Subdomain Discovery** | Finds associated subdomains | `subdomains` |
 | 📁 **Directory Scanning** | Detects exposed directories | `dirs` |
 | 🛡️ **Full Audit** | Complete security assessment | `audit` |
 | 📊 **Multiple Reports** | Text, JSON, HTML, CSV, Markdown | `--format` |
 | 📈 **Scoring & Grading** | Weighted 0–100 security-header scores | Built-in |
-| 💾 **History & Storage** | Save & retrieve scan results | REST API |
-| 🔌 **REST API** | Programmatic access | `serve` |
+| 💾 **History & Storage** | Save & retrieve scan results with JSON or SQLite | REST API |
+| 🔐 **Safer API Scans** | Bearer roles, target allowlists, DNS pinning, and URL-secret redaction | `serve` |
+| 🔌 **REST API** | Programmatic access, batch scans, reports, comparisons, and history | `serve` |
 
 ---
 
@@ -37,16 +38,17 @@
 3. [Quick Start](#-quick-start)
 4. [Installation](#-installation)
 5. [Usage Guide](#usage-guide)
-6. [Assessment Results](#understanding-security-assessment-results)
-7. [Developer Guide](#-for-developers)
-8. [Publishing to GitHub](#publishing-to-github)
-9. [FAQ](#frequently-asked-questions)
+6. [Docker](#docker)
+7. [Assessment Results](#understanding-results)
+8. [Developer Guide](#-for-developers)
+9. [CI/CD and GHCR](#cicd-and-github-container-registry)
+10. [FAQ](#frequently-asked-questions)
 
 ---
 
 ## Overview
 
-**Security Headers Scanner Pro** is a comprehensive security assessment tool that validates HTTP security headers, SSL/TLS configuration, and web application security posture. It analyzes websites against industry security standards and best practices.
+**Security Headers Scanner Pro** is a Python command-line and library tool that validates HTTP security headers, SSL/TLS configuration, and web application security posture. Run it locally for one-off scans; the authenticated REST API is optional and only needs to be started or deployed when other systems require HTTP access or shared history.
 
 ### Key Benefits
 
@@ -302,6 +304,36 @@ Shows the nine modern security headers checked by default.
 
 ---
 
+## Docker
+
+The Docker image packages the existing CLI (it does not add a web UI). It installs dependencies from `requirements.lock` with hash verification and runs as an unprivileged `scanner` user. Install [Docker Engine](https://docs.docker.com/engine/install/) on Linux or [Docker Desktop](https://docs.docker.com/desktop/) on macOS/Windows, then confirm `docker --version` and that the daemon is running. No server deployment is needed for ordinary CLI scans; Docker is an optional way to package the CLI consistently.
+
+### Build and run locally
+
+Run these commands from the repository root:
+
+```bash
+docker build --pull -t security-header-scanner:local .
+docker run --rm security-header-scanner:local --help
+docker run --rm security-header-scanner:local headers
+docker run --rm security-header-scanner:local scan https://example.com --format json
+```
+
+The image entrypoint is `python main.py`, so pass any normal CLI command after the image name. Scans make outbound requests from inside the container. Use only targets you own or have permission to assess.
+
+To keep a generated report on the host, create a writable `reports/` directory and mount it into the container:
+
+```bash
+mkdir -p reports
+docker run --rm --user "$(id -u):$(id -g)" \\
+  -v "$PWD/reports:/reports" security-header-scanner:local \\
+  scan https://example.com --format html --output /reports/scan.html
+```
+
+The container can also run the optional API with `serve --host 0.0.0.0`; publish it only behind an authenticated, TLS-protected reverse proxy. See [API deployment guidance](#-start-api-server-for-developers).
+
+---
+
 ## 📈 Understanding Results
 
 ### Score & Grades
@@ -546,35 +578,77 @@ JSON index updates are atomic and locked; JSON data files and SQLite databases u
 
 ---
 
-## Publishing to GitHub
+## CI/CD and GitHub Container Registry
 
-### Repository Setup
+The [GitHub Actions status badge](https://github.com/Aman9422/security-header-scanner/actions/workflows/ci.yml) at the top of this README reports the current default-branch workflow status.
 
-1. Navigate to [GitHub new repository](https://github.com/new)
-2. Configure repository:
-   - Repository name: `security-header-scanner`
-   - Visibility: Public
-   - Initialize with: None (push existing code)
+### CI/CD architecture
 
-### Initial Commit and Push
+The workflow is defined in `.github/workflows/ci.yml` and runs on pushes to `main`/`master`, pull requests targeting those branches, weekly scheduled checks, and `v*` tag pushes.
+
+| Job | Purpose |
+|---|---|
+| `test` | Installs `requirements.lock` with `--require-hashes`, runs pytest with coverage on Python 3.10, 3.11, and 3.12, and uploads the Python 3.11 coverage report to Codecov. |
+| `quality` | Runs Flake8 syntax/undefined-name checks. Black and isort are pinned and enforced for changed Python files; legacy files are not reformatted as unrelated churn. |
+| `security-scan` | Runs Bandit and `pip-audit` against the locked dependencies, then retains a short-lived Bandit report artifact. |
+| `cli-validation` | Checks CLI help, the header listing, and a scan of `https://example.com`. |
+| `docker-build` | Uses Docker Buildx to build and run container smoke tests: non-root identity, CLI help, header listing, and sample website scan. On pull requests it builds locally only—no registry login or image push. |
+| `publish-image` | Runs only for a valid `vMAJOR.MINOR.PATCH` tag whose commit is already on the default branch. It waits for every test, quality, security, CLI, and Docker job to pass, then publishes to GHCR. |
+
+The workflow grants `contents: read` by default. Only `publish-image` gets `packages: write`, and it authenticates with the automatically provided `GITHUB_TOKEN`. There are no stored registry passwords or personal access tokens. Ordinary branch pushes, pull requests, and scheduled runs never publish an image.
+
+### Build and publish a version
+
+First merge the release changes to the default branch. Then create and push a new semantic version tag from that merged commit:
 
 ```bash
-cd security-header-scanner
-
-git init
-git add .
-git commit -m "Initial commit: Security Headers Scanner Pro"
-git branch -M main
-git remote add origin https://github.com/YOUR_USERNAME/security-header-scanner.git
-git push -u origin main
+git switch main
+git pull --ff-only origin main
+git tag -a v1.0.0 -m "Release v1.0.0"
+git push origin v1.0.0
 ```
 
-### Continuous Integration
+Use a new `vMAJOR.MINOR.PATCH` tag for each release. The tag starts the normal CI checks; GHCR publication is skipped unless all required checks pass and the release commit is contained in the default branch. The image receives `1.0.0`, `v1.0.0`, and `latest` tags. `latest` is updated only by a valid version-tag release, not by ordinary pushes.
 
-After pushing to GitHub, enable the following automations:
-- Automated test execution on push
-- Code quality checks
-- Coverage report generation
+### Pull and run a published image
+
+For a public package:
+
+```bash
+docker pull ghcr.io/aman9422/security-header-scanner:1.0.0
+docker run --rm ghcr.io/aman9422/security-header-scanner:1.0.0 --help
+docker run --rm ghcr.io/aman9422/security-header-scanner:1.0.0 scan https://example.com
+```
+
+The tag `latest` is also available after a release. For a private package, authenticate Docker to GHCR using your normal GitHub account/CLI setup before pulling; do not place credentials in scripts or source control. To make anonymous pulls available, set the package visibility to **Public** in the repository owner's GitHub Packages settings after the first publish.
+
+### Optional API container
+
+The image is primarily for CLI use. To run its API locally, create a token and a persistent data volume, then bind the service inside the container while exposing it only on the host loopback interface:
+
+```bash
+export SECURITY_SCANNER_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+docker volume create scanner-data
+docker run -d --name scanner-api \\
+  -p 127.0.0.1:5000:5000 \\
+  -e SECURITY_SCANNER_API_TOKEN="$SECURITY_SCANNER_API_TOKEN" \\
+  -v scanner-data:/app/data \\
+  ghcr.io/aman9422/security-header-scanner:1.0.0 \\
+  serve --host 0.0.0.0 --port 5000
+```
+
+For a public or shared deployment, terminate HTTPS at a trusted reverse proxy, restrict network access, use managed secrets, and configure destination allowlists and proxy trust deliberately. Do not expose an unrestricted scanner API directly to the internet.
+
+### Repository settings and troubleshooting
+
+- Ensure GitHub Actions is enabled for the repository and that repository/organization policy permits `GITHUB_TOKEN` to write packages. The workflow itself requests only `contents: read` globally and `packages: write` in the release job.
+- Protect the default branch and require the test, quality, security, CLI, and Docker checks before merging. Restrict who can create release tags if the package is sensitive.
+- A release job skipped on a branch push or pull request is expected. For publication, verify the pushed tag exactly matches `vMAJOR.MINOR.PATCH`, points to a commit on the default branch, and all required checks passed.
+- If the security job fails, review Bandit and `pip-audit` output and resolve findings in the source or hash-pinned `requirements.lock`; the check is intentionally fail-closed and blocks publication until it passes.
+- If GHCR reports permission denied, check organization Actions policy and package permissions. If `docker pull` is denied, make the package public or authenticate locally to GHCR.
+- If the sample scan fails in CI, check the CLI/Docker job logs and runner network access to `example.com`; this scan performs a real outbound HTTP request.
+- Codecov upload is explicitly non-blocking; the pytest test and coverage generation steps remain required.
+- To reproduce the container checks locally, run the Docker commands in the [Docker section](#docker). Docker must be installed and running.
 
 ---
 
